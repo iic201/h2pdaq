@@ -1,6 +1,0 @@
-#name: Release DAQ Package
-
-#on:
-#  push:
-#    branches:
-#      - main

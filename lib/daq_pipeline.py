@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
+import functools
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -132,8 +133,6 @@ def capture(source: str, direction: str = "both"):
 
     def decorator(func):
         _counter: dict[str, itertools.count] = {}  # per source+method
-
-        import functools
 
         @functools.wraps(func)
         async def wrapper(self_svc, *args, **kwargs):
