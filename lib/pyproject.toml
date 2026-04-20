@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,3 +12,6 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/iic201/h2pcontrol-daq.git"

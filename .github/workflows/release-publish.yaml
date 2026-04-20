@@ -1,0 +1,32 @@
+name: Release & Publish
+
+on:
+  push:
+    tags: -'v*'
+jobs:
+  publish:
+    defaults:
+      runs:
+        working-directory: ./lib
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build package
+        run: |
+          pip install build
+          python -m build  # produces dist/*.whl and dist/*.tar.gz
+
+      # ── GitHub Release (enables git+ installs) ──────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
