@@ -15,3 +15,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/iic201/h2pcontrol-daq.git"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["daq_pipeline*"] 
