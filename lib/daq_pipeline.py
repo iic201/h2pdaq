@@ -34,6 +34,9 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
+import h5py
+import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # Event model
@@ -287,8 +290,7 @@ class DAQPipeline:
     async def start(self) -> None:
         """Spawn all pipeline background tasks."""
         self._tasks = [
-            asyncio.create_task(self._normalizer_task(),
-                                name="daq-normalizer"),
+            asyncio.create_task(self._normalizer_task(), name="daq-normalizer"),
             asyncio.create_task(self._hdf5_writer_task(), name="daq-hdf5"),
             asyncio.create_task(self._influx_writer_task(), name="daq-influx"),
             asyncio.create_task(self._ui_broadcaster_task(), name="daq-ui"),
@@ -344,8 +346,7 @@ class DAQPipeline:
                 try:
                     q.put_nowait(enriched)
                 except asyncio.QueueFull:
-                    setattr(self.stats, stat_name, getattr(
-                        self.stats, stat_name) + 1)
+                    setattr(self.stats, stat_name, getattr(self.stats, stat_name) + 1)
 
             self._ingress_queue.task_done()
 
@@ -380,8 +381,7 @@ class DAQPipeline:
             batch_full = len(batch) >= self._hdf5_batch_size
 
             if batch and (
-                flush_due or batch_full or (
-                    self._stopping and self._hdf5_queue.empty())
+                flush_due or batch_full or (self._stopping and self._hdf5_queue.empty())
             ):
                 await loop.run_in_executor(
                     self._io_executor, self._flush_hdf5_batch, batch.copy()
@@ -415,8 +415,7 @@ class DAQPipeline:
                 grp = f.require_group(grp_path)
 
                 # Write timestamp
-                self._hdf5_append(
-                    grp, "ts_ns", event.timestamp_ns, dtype="int64")
+                self._hdf5_append(grp, "ts_ns", event.timestamp_ns, dtype="int64")
 
                 # Write each payload field
                 for fname, fval in self._flatten_payload(event.payload):
@@ -430,9 +429,6 @@ class DAQPipeline:
     @staticmethod
     def _hdf5_append(grp, name: str, value, dtype=None) -> None:
         """Lazily create and resize a 1-D chunked dataset."""
-        import h5py
-        import numpy as np
-
         if name not in grp:
             if dtype:
                 grp.create_dataset(
@@ -443,8 +439,7 @@ class DAQPipeline:
                 )
             else:
                 arr = np.array([value])
-                grp.create_dataset(
-                    name, data=arr, maxshape=(None,), chunks=(1024,))
+                grp.create_dataset(name, data=arr, maxshape=(None,), chunks=(1024,))
         else:
             ds = grp[name]
             ds.resize(ds.shape[0] + 1, axis=0)
@@ -502,8 +497,7 @@ class DAQPipeline:
                     if fval is None or isinstance(fval, (dict, list)):
                         continue
                     batch.append(
-                        Point(f"{event.source}_{
-                              event.method}_{event.direction}")
+                        Point(f"{event.source}_{event.method}_{event.direction}")
                         .tag("run_id", event.run_id)
                         .tag("sequence", str(event.sequence))
                         .field(fname, fval)
