@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,4 +11,26 @@ authors = [
   { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "h5py>=3.10.0",
+  "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+influx = [
+  "influxdb-client>=1.49.0",
+]
+grpc = [
+  "betterproto2==0.4.0",
+  "grpcio>=1.72.1",
+  "grpclib>=0.4.8",
+]
+dev = [
+  "build>=1.2.2.post1",
+]
+
+[project.urls]
+Homepage = "https://github.com/iic201/h2pcontrol-daq.git"
+
+[tool.setuptools]
+py-modules = ["daq_pipeline"]
