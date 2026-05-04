@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daq-central"
+version = "0.1.0"
+description = "Minimal central ingest service for h2pcontrol-daq"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+hdf5 = ["h5py>=3.0"]
+influx = ["influxdb-client>=1.18"]
+all = [
+    "h5py>=3.0",
+    "influxdb-client>=1.18",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[tool.setuptools]
+py-modules = ["central_ingest", "central_pipeline"]

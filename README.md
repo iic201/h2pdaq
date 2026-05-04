@@ -35,7 +35,6 @@ flowchart LR
     subgraph Core["Central DAQ"]
         COL["DAQ Collector / Ingest"]
         Q["Internal queue / buffer"]
-        META["Run metadata store"]
         IFX["InfluxDB"]
         H5["HDF5 archive"]
         CSV["CSV export folder"]
@@ -55,9 +54,7 @@ flowchart LR
     Q --> IFX
     Q --> H5
     Q --> CSV
-    COL --> META
 
-    API --> META
     API --> H5
     API --> CSV
     API --> COL
@@ -71,7 +68,7 @@ Each server imports the lib package (`h2pcontrol-daq/lib`) and uses it to decora
 (see the `h2pcontrol-daq/lib/pipeline.py` file for more details) and sends the data to the central DAQ server (`h2pcontrol-daq/server`).
 Note that this part of sending it to the central DAQ is optional, and the local pipeline can be used without sending it to the central DAQ server.
 However, if the data is sent to the central DAQ server, it will be processed and stored in the central InfluxDB, HDF5 archive and CSV export folder.
-This central DAQ server then processes the data and stores it in the central InfluxDB, HDF5 archive and CSV export folder.
+For now, the central pipeline subscribes to the producer UI broadcaster, relays those events into the central ingest queue, and then the ingest layer stores them in the central InfluxDB, HDF5 archive and CSV export folder.
 The UI layer then interacts with the central DAQ server to retrieve the data and display it to the user. Grafana is used to visualize the data from the InfluxDB, while the custom Python UI can retrieve data from the central DAQ server and display it in a custom way.
 
 ## Test 
