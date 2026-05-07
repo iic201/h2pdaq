@@ -34,3 +34,4 @@ Homepage = "https://github.com/iic201/h2pcontrol-daq.git"
 
 [tool.setuptools]
 py-modules = ["daq_pipeline"]
+packages = ["h2pcontrol"]
