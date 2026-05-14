@@ -1,31 +1,17 @@
 from __future__ import annotations
-
-import time
-import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable, Literal
 
-
-class PayloadEncoding(StrEnum):
-    JSON_DICT = "json_dict"
-
-
 @dataclass(frozen=True, slots=True)
 class PendingEvent:
+    event_id: str
     run_id: str
     producer_id: str
     source: str
     method: str
     direction: Literal["in", "out", "error"]
-    sequence: int
-    message: Any
-    serializer: Callable[[Any], dict[str, Any]]
-    wall_time_ns: int = field(default_factory=time.time_ns)
-    monotonic_ns: int = field(default_factory=time.monotonic_ns)
-    event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    quality: int = 0
-
+    data: Any
 
 @dataclass(frozen=True, slots=True)
 class DAQEvent:
@@ -35,12 +21,25 @@ class DAQEvent:
     source: str
     method: str
     direction: Literal["in", "out", "error"]
-    sequence: int
-    wall_time_ns: int
-    monotonic_ns: int
-    payload: dict[str, Any]
-    payload_encoding: PayloadEncoding = PayloadEncoding.JSON_DICT
-    quality: int = 0
+    data: Any
+    
+@dataclass(slots=True)
+class LocalDAQStats:
+    published: int = 0
+    serialized: int = 0
+    dropped_ingress: int = 0
+    dropped_outbound: int = 0
+    serialization_errors: int = 0
 
-    def to_wire_dict(self) -> dict[str, Any]:
-        return asdict(self)
+class OverflowPolicy(StrEnum):
+    DROP_NEWEST = "drop_newest"
+    DROP_OLDEST = "drop_oldest"
+    BLOCK_WITH_TIMEOUT = "block_with_timeout"
+
+@dataclass(slots=True)
+class DAQConfig:
+    ingress_maxsize: int = 10_000 # Maximum number of PendingEvent in the ingress queue before applying overflow policy.
+    outbound_maxsize: int = 10_000 # Maximum number of serialized events in the outbound queue before applying overflow policy.
+    queue_put_timeout_s: float = 0.1 # Timeout in seconds for blocking a put operation to the queue when using BLOCK_WITH_TIMEOUT policy.
+    ingress_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
+    outbound_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST

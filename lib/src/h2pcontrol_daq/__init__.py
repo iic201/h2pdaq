@@ -1,6 +1,5 @@
 from .capture import capture
-from .config import DAQConfig, OverflowPolicy
-from .models import DAQEvent, PendingEvent, PayloadEncoding
+from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig
 from .pipeline import LocalDAQ
 
 __all__ = [
@@ -9,6 +8,5 @@ __all__ = [
     "OverflowPolicy",
     "DAQEvent",
     "PendingEvent",
-    "PayloadEncoding",
     "LocalDAQ",
 ]

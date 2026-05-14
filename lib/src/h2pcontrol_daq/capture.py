@@ -9,7 +9,9 @@ import os
 import h5py
 import socket
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
+from .pipeline import LocalDAQ
+from .models import PendingEvent
 
 # TODO: The run id at the moment is not unique per client program, but per capture session. 
 # We may want to make it unique per client program in the future.
@@ -82,10 +84,12 @@ def _pick_kwargs(kwargs: dict, keys: Sequence[str] | None):
     return {k: v for k, v in kwargs.items() if k in keys}
 
 def capture(
+        daq: LocalDAQ,
         source: str, 
         direction: str = "both",
         in_args: Sequence[int] | None = None,
         in_kwargs: Sequence[str] | None = None,
+        producer_id: str = "default_producer_id",
     ):
 
     log_in = direction in ("in", "both")
@@ -105,63 +109,87 @@ def capture(
                 json_args = json.dumps(picked_args, default=str)
                 json_kwargs = json.dumps(picked_kwargs, default=str)
                 timestamp = datetime.now().isoformat()
+                data = {"args": json_args, "kwargs": json_kwargs}
+                pending_event = PendingEvent(
+                    event_id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    producer_id=producer_id,
+                    source=source,
+                    method=func.__name__,
+                    direction="in",
+                    data=data,
+                )
+                daq.publish_pending_event(pending_event)
                 print(
                     f"[DAQ][{run_id}] Captured IN event from {source}: "
                     f"args={json_args}, kwargs={json_kwargs} at {timestamp}"
                 )
-                save_to_csv(
-                    csv_target,
-                    {
-                        "run_id": run_id,
-                        "timestamp": timestamp,
-                        "source": source,
-                        "direction": "in",
-                        "args": picked_args,
-                        "kwargs": picked_kwargs,
-                        "result": "",
-                    },
-                    _DEFAULT_CSV_FIELDS,
-                )
-                save_to_hdf5(hdf5_target, {
-                    "run_id": run_id,
-                    "timestamp": timestamp,
-                    "source": source,
-                    "direction": "in",
-                    "args": picked_args,
-                    "kwargs": picked_kwargs,
-                })
+
+
+                # save_to_csv(
+                #     csv_target,
+                #     {
+                #         "run_id": run_id,
+                #         "timestamp": timestamp,
+                #         "source": source,
+                #         "direction": "in",
+                #         "args": picked_args,
+                #         "kwargs": picked_kwargs,
+                #         "result": "",
+                #     },
+                #     _DEFAULT_CSV_FIELDS,
+                # )
+                # save_to_hdf5(hdf5_target, {
+                #     "run_id": run_id,
+                #     "timestamp": timestamp,
+                #     "source": source,
+                #     "direction": "in",
+                #     "args": picked_args,
+                #     "kwargs": picked_kwargs,
+                # })
 
             result = await func(self_svc, *args, **kwargs)
 
             if log_out:
                 json_result = json.dumps(result, default=str)
                 timestamp = datetime.now().isoformat()
+                data = {"result": json_result}
+                pending_event = PendingEvent(
+                    event_id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    producer_id=producer_id,
+                    source=source,
+                    method=func.__name__,
+                    direction="out",
+                    data=data,
+                )
+                daq.publish_pending_event(pending_event)
                 print(
                     f"[DAQ][{run_id}] Captured OUT event from {source}: "
                     f"result={json_result} at {timestamp}"
                 )
-                save_to_csv(
-                    csv_target,
-                    {
-                        "run_id": run_id,
-                        "timestamp": timestamp,
-                        "source": source,
-                        "direction": "out",
-                        "args": "",
-                        "kwargs": "",
-                        "result": json_result,
-                    },
-                    _DEFAULT_CSV_FIELDS,
-                )
-                save_to_hdf5(hdf5_target, {
-                    "run_id": run_id,
-                    "timestamp": timestamp,
-                    "source": source,
-                    "direction": "out",
-                    "args": "",
-                    "kwargs": "",
-                    "result": json_result,
-                })
+                # save_to_csv(
+                #     csv_target,
+                #     {
+                #         "run_id": run_id,
+                #         "timestamp": timestamp,
+                #         "source": source,
+                #         "direction": "out",
+                #         "args": "",
+                #         "kwargs": "",
+                #         "result": json_result,
+                #     },
+                #     _DEFAULT_CSV_FIELDS,
+                # )
+                # save_to_hdf5(hdf5_target, {
+                #     "run_id": run_id,
+                #     "timestamp": timestamp,
+                #     "source": source,
+                #     "direction": "out",
+                #     "args": "",
+                #     "kwargs": "",
+                #     "result": json_result,
+                # })
             return result
 
         return wrapper

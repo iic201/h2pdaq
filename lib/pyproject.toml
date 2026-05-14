@@ -5,8 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "h2pcontrol-daq"
 version = "0.1.0"
-description = "Lightweight local DAQ package for H2PControl producers"
-readme = "README.md"
+maintainers = [
+    { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
+]
+description = "LocalDAQ package for H2PControl servers"
 requires-python = ">=3.11"
 dependencies = [
     "h5py",
