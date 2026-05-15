@@ -3,9 +3,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable, Literal
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PendingEvent:
-    event_id: str
+    event_id: int
+    timestamp: str
     run_id: str
     producer_id: str
     source: str
@@ -15,7 +16,8 @@ class PendingEvent:
 
 @dataclass(frozen=True, slots=True)
 class DAQEvent:
-    event_id: str
+    event_id: int
+    timestamp: str
     run_id: str
     producer_id: str
     source: str
@@ -28,7 +30,9 @@ class LocalDAQStats:
     published: int = 0
     serialized: int = 0
     dropped_ingress: int = 0
-    dropped_outbound: int = 0
+    dropped_outbound_csv: int = 0
+    dropped_outbound_hdf5: int = 0
+    dropped_outbound_jsonl: int = 0
     serialization_errors: int = 0
 
 class OverflowPolicy(StrEnum):
