@@ -7,11 +7,12 @@ import h5py
 import logging
 import csv
 from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig, LocalDAQStats
+from .centralDAQ_connector.grpc_central_sink import GrpcDAQSink
 from pathlib import Path
 
 class LocalDAQ:
-    def __init__(self) -> None:
-        self.config = DAQConfig()
+    def __init__(self, config: DAQConfig | None = None) -> None:
+        self.config = config if config is not None else DAQConfig()
         self.stats = LocalDAQStats()
         self.logger = self.setup_logger()
 
@@ -27,10 +28,19 @@ class LocalDAQ:
         self._outbound_csv_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
+        self._outbound_central_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
+            maxsize=self.config.outbound_maxsize
+        )
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
         self._data_path = self._create_data_path()
         self._event_id_counter = 1
+
+        self.central_sink: GrpcDAQSink = GrpcDAQSink(
+            central_address=self.config.central_daq_address or "127.0.0.1:50052",
+            queue=self._outbound_central_q,
+            logger=self.logger
+        )
 
     async def start(self) -> None:
         self.logger.info("Starting DAQ with config: %s", self.config)
@@ -42,6 +52,12 @@ class LocalDAQ:
             asyncio.create_task(self._writer_csv_loop(), name="daq-writer-csv"),
         ]
 
+        if self.config.enable_central_stream:
+            self.logger.info("[C] Central stream enabled. Starting central sink task.")
+            self._tasks.append(
+                asyncio.create_task(self.central_sink.run(), name="daq-central-sink")
+            )
+
     async def stop(self) -> None:
         self.logger.info("Stopping DAQ having published %s events. Having dropped %s ingress events and %s outbound events.\n", 
                          self.stats.published, self.stats.dropped_ingress, self.stats.dropped_outbound_jsonl + self.stats.dropped_outbound_hdf5 + self.stats.dropped_outbound_csv)
@@ -51,6 +67,7 @@ class LocalDAQ:
         await self._outbound_jsonl_q.join()
         await self._outbound_hdf5_q.join()
         await self._outbound_csv_q.join()
+        await self._outbound_central_q.join()
         # Cancel any remaining tasks
         for task in self._tasks:
             task.cancel()
@@ -84,6 +101,8 @@ class LocalDAQ:
             counter_name = "dropped_outbound_hdf5"
         elif queue_name == "outbound_csv":
             counter_name = "dropped_outbound_csv"
+        elif queue_name == "outbound_central":
+            counter_name = "dropped_outbound_central"
 
         if policy == OverflowPolicy.DROP_NEWEST:
             setattr(self.stats, counter_name, getattr(
@@ -147,6 +166,15 @@ class LocalDAQ:
                     self.config.outbound_overflow,
                     "outbound_hdf5",
                 )
+
+                if self.config.enable_central_stream:
+                    self.logger.info("[C] Central stream enabled. Queuing event.")
+                    self._queue_put_now(
+                        self._outbound_central_q,
+                        event,
+                        self.config.outbound_overflow,
+                        "outbound_central",
+                    )
             except Exception:
                 self.stats.serialization_errors += 1
             finally:

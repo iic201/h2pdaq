@@ -3,9 +3,9 @@
 The local DAQ package is the client-side capture layer for the h2pcontrol system. Its purpose is to intercept method calls in a producer service, turn them into structured events, and persist those events locally in a few simple formats.
 
 ```mermaid
-flowchart LR
-	A[Producer service] --> B[capture(...)]
-	B --> C[PendingEvent<br/>inbound]
+flowchart TB
+	A[Producer service] --> B[capture(...) ]
+	B --> C[PendingEvent inbound]
 	C --> D[LocalDAQ ingress queue]
 	D --> E[Serializer task]
 	E --> F[DAQEvent]
@@ -22,6 +22,22 @@ flowchart LR
 	H -. logs .-> N
 	I -. logs .-> N
 ```
+
+### Complexity
+
+The current per-event control flow is:
+
+- `capture(...)`: time `O(1)`, space `O(1)` per call, excluding the wrapped producer method.
+- `PendingEvent` creation: time `O(1)`, space `O(1)`.
+- Ingress queue enqueue: time `O(1)`, space `O(q)` for queued events.
+- Serializer task: time `O(1)` per event, space `O(1)`.
+- `DAQEvent` creation: time `O(1)`, space `O(1)`.
+- JSONL writer: time `O(1)` append per event, space `O(1)`.
+- CSV writer: time `O(1)` append per event, space `O(1)`.
+- HDF5 writer: time `O(1)` append per event in the current design, space `O(1)`.
+- `LocalDAQStats` updates: time `O(1)`, space `O(1)`.
+
+The generated files grow on disk over time, but that file growth is not counted as in-memory working space.
 
 ### Current flow
 

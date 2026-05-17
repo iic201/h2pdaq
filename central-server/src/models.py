@@ -1,18 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, Literal
-
-@dataclass(slots=True)
-class PendingEvent:
-    event_id: int
-    timestamp: str
-    run_id: str
-    producer_id: str
-    source: str
-    method: str
-    direction: Literal["in", "out", "error"]
-    data: Any
+from typing import Any, Literal
 
 @dataclass(frozen=True, slots=True)
 class DAQEvent:
@@ -26,9 +15,9 @@ class DAQEvent:
     data: Any
     
 @dataclass(slots=True)
-class LocalDAQStats:
-    published: int = 0
-    serialized: int = 0
+class CentralDAQStats:
+    received: int = 0
+    ingested: int = 0
     dropped_ingress: int = 0
     dropped_outbound_csv: int = 0
     dropped_outbound_hdf5: int = 0
@@ -42,12 +31,11 @@ class OverflowPolicy(StrEnum):
     BLOCK_WITH_TIMEOUT = "block_with_timeout"
 
 @dataclass(slots=True)
-class DAQConfig:
-    ingress_maxsize: int = 10_000 # Maximum number of PendingEvent in the ingress queue before applying overflow policy.
-    outbound_maxsize: int = 10_000 # Maximum number of serialized events in the outbound queue before applying overflow policy.
+class CentralDAQConfig:
+    ingest_maxsize: int = 100_000 # Maximum number of PendingEvent in the ingress queue before applying overflow policy.
+    outbound_maxsize: int = 100_000 # Maximum number of serialized events in the outbound queue before applying overflow policy.
     queue_put_timeout_s: float = 0.1 # Timeout in seconds for blocking a put operation to the queue when using BLOCK_WITH_TIMEOUT policy.
     ingress_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     outbound_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
-    enable_central_stream: bool = True
-    central_daq_address: str | None = None
+    address: str | None = None
 

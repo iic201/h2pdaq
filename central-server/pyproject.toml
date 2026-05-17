@@ -1,26 +1,19 @@
-[build-system]
-requires = ["hatchling>=1.25.0"]
-build-backend = "hatchling.build"
-
 [project]
-name = "h2pcontrol-daq"
+name = "h2pcontrol-daq-central"
 version = "0.1.0"
+requires-python = ">=3.12"
 maintainers = [
     { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
 ]
-description = "LocalDAQ package for H2PControl servers"
-requires-python = ">=3.11"
+description = "Central DAQ server for h2pcontrol software"
 dependencies = [
     "h5py",
-    "grpcio",
+    "protobuf",
     "grpcio>=1.80.0",
     "beyer-labs-h2pcontrol-grpc-python>=1.80.0.1.20260406165239",
     "beyer-labs-h2pcontrol-protocolbuffers-pyi>=34.1.0.1.20260406165239",
     "beyer-labs-h2pcontrol-protocolbuffers-python>=34.1.0.1.20260406165239",
 ]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/h2pcontrol_daq"]
 
 [[tool.uv.index]]
 url = "https://buf.build/gen/python"
