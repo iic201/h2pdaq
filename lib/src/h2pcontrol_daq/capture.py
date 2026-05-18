@@ -1,13 +1,14 @@
 from __future__ import annotations
 import functools
 import json
-import threading
 import uuid
 from datetime import datetime, time
 import os
 import socket
 import time
 from typing import Any, Sequence
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import Message
 from .pipeline import LocalDAQ
 from .models import PendingEvent
 
@@ -31,6 +32,19 @@ def _pick_kwargs(kwargs: dict, keys: Sequence[str] | None):
         return kwargs
     return {k: v for k, v in kwargs.items() if k in keys}
 
+def _normalize_for_json(value: Any) -> Any:
+    if isinstance(value, Message):
+        return MessageToDict(value, preserving_proto_field_name=True)
+    if isinstance(value, dict):
+        return {k: _normalize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_json(v) for v in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
 def capture(
         daq: LocalDAQ,
         source: str, 
@@ -52,10 +66,11 @@ def capture(
             if log_in:
                 picked_args = _pick_args(args, in_args)
                 picked_kwargs = _pick_kwargs(kwargs, in_kwargs)
-                json_args = json.dumps(picked_args, default=str)
-                json_kwargs = json.dumps(picked_kwargs, default=str)
                 timestamp = datetime.now().isoformat()
-                data = {"args": json_args, "kwargs": json_kwargs}
+                data = {
+                    "args": _normalize_for_json(picked_args),
+                    "kwargs": _normalize_for_json(picked_kwargs),
+                }
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,
@@ -71,9 +86,8 @@ def capture(
             result = await func(self_svc, *args, **kwargs)
 
             if log_out:
-                json_result = json.dumps(result, default=str)
                 timestamp = datetime.now().isoformat()
-                data = {"result": json_result}
+                data = {"result": _normalize_for_json(result)}
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,

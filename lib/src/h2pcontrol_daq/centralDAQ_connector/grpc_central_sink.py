@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 
@@ -52,30 +53,45 @@ class GrpcDAQSink:
                 ("grpc.max_send_message_length", 50 * 1024 * 1024),
             ],
         ) as channel:
+            try:
+                await asyncio.wait_for(channel.channel_ready(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "[C] Central DAQ channel not ready; retrying soon"
+                )
+                return
             stub = CentralDAQServiceStub(channel)
-
-            response = await stub.StreamDAQEvents(self._event_generator())
-
-            self.logger.info(
-                "[C] Central DAQ stream closed: received=%s message=%s",
-                response.received,
-                response.message,
-            )
-
-    async def _event_generator(self):
-        while not self._stopping:
-            event = await self.queue.get()
+            call = stub.StreamDAQEvents()
 
             try:
-                yield StreamDAQEventsRequest(
-                    event_id=event.event_id,
-                    timestamp=event.timestamp,
-                    run_id=event.run_id,
-                    producer_id=event.producer_id,
-                    source=event.source,
-                    method=event.method,
-                    direction=event.direction,
-                    data=json.dumps(event.data, default=str),
-                )
+                while not self._stopping:
+                    event = await self.queue.get()
+                    try:
+                        await call.write(
+                            StreamDAQEventsRequest(
+                                event_id=event.event_id,
+                                timestamp=event.timestamp,
+                                run_id=event.run_id,
+                                producer_id=event.producer_id,
+                                source=event.source,
+                                method=event.method,
+                                direction=event.direction,
+                                data=json.dumps(event.data, default=str),
+                            )
+                        )
+                    except Exception:
+                        with contextlib.suppress(asyncio.QueueFull):
+                            self.queue.put_nowait(event)
+                        raise
+                    finally:
+                        self.queue.task_done()
             finally:
-                self.queue.task_done()
+                with contextlib.suppress(Exception):
+                    await call.done_writing()
+                with contextlib.suppress(Exception):
+                    response = await call
+                    self.logger.info(
+                        "[C] Central DAQ stream closed: received=%s message=%s",
+                        response.received,
+                        response.message,
+                    )
