@@ -15,10 +15,11 @@ from h2pcontrol.central_daq.v1.central_daq_pb2 import (
 from h2pcontrol.central_daq.v1.central_daq_pb2_grpc import (
     CentralDAQServiceServicer,
 )
-
+from .influxdb import InfluxDBClient, InfluxDBConfig
 from .models import DAQEvent, CentralDAQConfig, CentralDAQStats
+import aiofiles
 
-# TODO: Use aiofiles python for async file writing in the JSONL, HDF5 and csv loop.
+# TODO: Use batching writes for CSV and JSONL to improve performance.
 
 class CentralDAQService(CentralDAQServiceServicer):
     def __init__(self) -> None:
@@ -42,6 +43,8 @@ class CentralDAQService(CentralDAQServiceServicer):
             maxsize=self.config.outbound_maxsize
         )
 
+        self._influx = InfluxDBClient(InfluxDBConfig(), logger=self.logger)
+
         self._data_path_created = self._data_path()
         self._stopping = False
 
@@ -60,7 +63,7 @@ class CentralDAQService(CentralDAQServiceServicer):
             asyncio.create_task(self._ingest_loop()),
             asyncio.create_task(self._outbound_csv_loop()),
             asyncio.create_task(self._outbound_jsonl_loop()),
-            # asyncio.create_task(self._outbound_influx_loop()),
+            asyncio.create_task(self._outbound_influx_loop()),
             asyncio.create_task(self._outbound_hdf5_loop()),
         ]
 
@@ -69,15 +72,16 @@ class CentralDAQService(CentralDAQServiceServicer):
         await self._ingest_q.join()
         await self._outbound_csv_q.join()
         await self._outbound_jsonl_q.join()
-        # await self._outbound_influx_q.join()
+        await self._outbound_influx_q.join()
         await self._outbound_hdf5_q.join()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.to_thread(self._influx.close)
         self.logger.info("[Central-DAQ] Service stopped. Having received %s events and having dropped %s events in the ingress queue."
                          , self.stats.received, self.stats.dropped_ingress)
-        self.logger.info("[Central-DAQ] In the outbound queues, having dropped %s events in the CSV queue, %s events in the JSONL queue, %s events in the HDF5 queue.",
-                         self.stats.dropped_outbound_csv, self.stats.dropped_outbound_jsonl, self.stats.dropped_outbound_hdf5)
+        self.logger.info("[Central-DAQ] In the outbound queues, having dropped %s events in the CSV queue, %s events in the JSONL queue, %s events in the HDF5 queue, %s events in the InfluxDB queue.",
+                         self.stats.dropped_outbound_csv, self.stats.dropped_outbound_jsonl, self.stats.dropped_outbound_hdf5, self.stats.dropped_outbound_influx)
 
 
     async def accept_event(self, event: StreamDAQEventsRequest) -> None:
@@ -144,6 +148,7 @@ class CentralDAQService(CentralDAQServiceServicer):
                 )
                 await self._outbound_csv_q.put(daq_event)
                 await self._outbound_jsonl_q.put(daq_event)
+                await self._outbound_influx_q.put(daq_event)
                 await self._outbound_hdf5_q.put(daq_event)
             except Exception as e:
                 self.stats.dropped_ingress += 1
@@ -159,7 +164,7 @@ class CentralDAQService(CentralDAQServiceServicer):
         while True:
             event = await self._outbound_csv_q.get()
             try:
-                await self._write_csv(event)
+                await asyncio.to_thread(self._write_csv, event)
             except Exception as e:
                 self.stats.dropped_outbound_csv += 1
                 self.logger.error(
@@ -170,7 +175,7 @@ class CentralDAQService(CentralDAQServiceServicer):
             finally:
                 self._outbound_csv_q.task_done()
 
-    async def _write_csv(self, event: DAQEvent) -> None:
+    def _write_csv(self, event: DAQEvent) -> None:
         if not self._data_path_created:
             self.logger.error("[Central-DAQ] Data path not created; cannot write CSV")
             return
@@ -244,18 +249,19 @@ class CentralDAQService(CentralDAQServiceServicer):
         
         file_path = "{path}/{producer_id}.jsonl".format(path=path, producer_id=event.producer_id)
 
-        with open(file_path, "a", encoding="utf-8") as f:
-            json_line = json.dumps({
-                "event_id": event.event_id,
-                "timestamp": event.timestamp,
-                "run_id": event.run_id,
-                "producer_id": event.producer_id,
-                "source": event.source,
-                "method": event.method,
-                "direction": event.direction,
-                "data": event.data,
-            }, default=str)
-            f.write(json_line + "\n")
+        json_line = json.dumps({
+            "event_id": event.event_id,
+            "timestamp": event.timestamp,
+            "run_id": event.run_id,
+            "producer_id": event.producer_id,
+            "source": event.source,
+            "method": event.method,
+            "direction": event.direction,
+            "data": event.data,
+        }, default=str)
+
+        async with aiofiles.open(file_path, "a", encoding="utf-8") as f:
+            await f.write(json_line + "\n")
 
         self.logger.info(
             "[Central-DAQ] Written JSONL for event_id=%s to %s",
@@ -265,13 +271,25 @@ class CentralDAQService(CentralDAQServiceServicer):
 
 
     async def _outbound_influx_loop(self) -> None:
-        pass
+        while True:
+            event = await self._outbound_influx_q.get()
+            try:
+                await asyncio.to_thread(self._influx.write_event, event)
+            except Exception as e:
+                self.stats.dropped_outbound_influx += 1
+                self.logger.error(
+                    "[Central-DAQ] Failed to write InfluxDB for event_id=%s: %s",
+                    event.event_id,
+                    str(e),
+                )
+            finally:
+                self._outbound_influx_q.task_done()
 
     async def _outbound_hdf5_loop(self) -> None:
         while True:
             event = await self._outbound_hdf5_q.get()
             try:
-                await self._write_hdf5(event)
+                await asyncio.to_thread(self._write_hdf5, event)
             except Exception as e:
                 self.stats.dropped_outbound_hdf5 += 1
                 self.logger.error(
@@ -282,7 +300,7 @@ class CentralDAQService(CentralDAQServiceServicer):
             finally:
                 self._outbound_hdf5_q.task_done()
 
-    async def _write_hdf5(self, event: DAQEvent) -> None:
+    def _write_hdf5(self, event: DAQEvent) -> None:
         if not self._data_path_created:
             self.logger.error("[Central-DAQ] Data path not created; cannot write HDF5")
             return

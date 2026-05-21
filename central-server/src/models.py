@@ -22,6 +22,7 @@ class CentralDAQStats:
     dropped_outbound_csv: int = 0
     dropped_outbound_hdf5: int = 0
     dropped_outbound_jsonl: int = 0
+    dropped_outbound_influx: int = 0
     dropped_outbound_central: int = 0
     serialization_errors: int = 0
 
