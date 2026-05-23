@@ -11,3 +11,4 @@ dist/
 .logs
 data/
 scripts/
+*.txt
