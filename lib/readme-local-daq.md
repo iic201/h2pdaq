@@ -70,6 +70,7 @@ Each event contains:
 - `method`
 - `direction`
 - `data`
+- `tags`
 
 For decorated methods, inbound events contain selected args/kwargs and outbound events contain the returned result.
 
@@ -78,7 +79,8 @@ For preview commits, event data contains:
 - `preview`
 - `analysis`
 - optional `metadata`
-- optional `tags`
+
+Preview tags are also mirrored into the event-level `tags` map so file writers, central streaming, and InfluxDB can treat them as query labels.
 
 ### File Formats
 
@@ -162,7 +164,7 @@ INFLUXDB_BUCKET
 INFLUXDB_MEASUREMENT_PREFIX
 ```
 
-The writer uses `<measurement_prefix>_<source>` as the measurement name. It stores `run_id`, `producer_id`, `source`, `method`, and `direction` as tags. It stores only finite numeric and boolean measurement values as fields. Bulky descriptive subtrees such as `analysis`, `metadata`, `tags`, and board/static info stay in JSONL/CSV/HDF5 instead of being expanded into InfluxDB fields.
+The writer uses `<measurement_prefix>_<source>` as the measurement name. It stores `run_id`, `producer_id`, `source`, `method`, `direction`, and event-level `tags` as InfluxDB tags. It stores only finite numeric and boolean measurement values as fields. Bulky descriptive subtrees such as `analysis`, `metadata`, and board/static info stay in JSONL/CSV/HDF5 instead of being expanded into InfluxDB fields.
 
 ### Notes
 

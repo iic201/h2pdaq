@@ -233,6 +233,12 @@ class LocalDAQ:
                 continue
 
             try:
+                tags = _normalize_tags(
+                    {
+                        **_normalize_tags(_extract_tags_from_data(pending.data)),
+                        **_normalize_tags(pending.tags if isinstance(pending.tags, Mapping) else {}),
+                    }
+                )
                 event = DAQEvent(
                     event_id=pending.event_id,
                     run_id=pending.run_id,
@@ -242,6 +248,7 @@ class LocalDAQ:
                     method=pending.method,
                     direction=pending.direction,
                     data=pending.data,
+                    tags=tags,
                 )
                 self.stats.serialized += 1
                 # self._queue_put_now(
@@ -445,6 +452,7 @@ class LocalDAQ:
                 "source": event.source,
                 "method": event.method,
                 "direction": event.direction,
+                "tags": event.tags,
                 "message": event.data,
             }
             with path.open("a", encoding="utf-8") as f:
@@ -463,7 +471,7 @@ class LocalDAQ:
         for event in events:
             events_by_run.setdefault(event.run_id, []).append(event)
 
-        base_fieldnames = [
+        event_fieldnames = [
             "event_id",
             "timestamp",
             "run_id",
@@ -472,45 +480,66 @@ class LocalDAQ:
             "method",
             "direction",
         ]
+        compact_fieldnames = [
+            *event_fieldnames,
+            "value",
+            "unit",
+            "integral",
+            "integral_unit",
+        ]
 
         for run_id, run_events in events_by_run.items():
             path = Path("data/csv") / f"daq_capture_{_safe_filename_part(run_id)}.csv"
+            if self.config.verbose_save:
+                rows = [
+                    {
+                        "event_id": event.event_id,
+                        "timestamp": event.timestamp,
+                        "run_id": event.run_id,
+                        "producer_id": event.producer_id,
+                        "source": event.source,
+                        "method": event.method,
+                        "direction": event.direction,
+                        **_flatten_for_csv(event.tags, prefix="tags"),
+                        **_flatten_for_csv(event.data, prefix="data"),
+                    }
+                    for event in run_events
+                ]
+                existing_rows: list[dict[str, Any]] = []
+                existing_fieldnames: list[str] = []
+                if path.exists():
+                    with path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        existing_fieldnames = list(reader.fieldnames or [])
+                        existing_rows = list(reader)
+
+                dynamic_fieldnames = sorted(
+                    {
+                        key
+                        for row in [*existing_rows, *rows]
+                        for key in row
+                        if key not in event_fieldnames
+                    }
+                )
+                fieldnames = event_fieldnames + dynamic_fieldnames
+                mode = "w" if existing_fieldnames != fieldnames else "a"
+                with path.open(mode, encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                    if mode == "w":
+                        writer.writeheader()
+                        writer.writerows(existing_rows)
+                    writer.writerows(rows)
+                continue
+
             rows = [
-                {
-                    "event_id": event.event_id,
-                    "timestamp": event.timestamp,
-                    "run_id": event.run_id,
-                    "producer_id": event.producer_id,
-                    "source": event.source,
-                    "method": event.method,
-                    "direction": event.direction,
-                    **_flatten_for_csv(event.data, prefix="data"),
-                }
+                _compact_csv_row(event)
                 for event in run_events
             ]
-            existing_rows: list[dict[str, Any]] = []
-            existing_fieldnames: list[str] = []
-            if path.exists():
-                with path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.DictReader(f)
-                    existing_fieldnames = list(reader.fieldnames or [])
-                    existing_rows = list(reader)
-
-            dynamic_fieldnames = sorted(
-                {
-                    key
-                    for row in [*existing_rows, *rows]
-                    for key in row
-                    if key not in base_fieldnames
-                }
-            )
-            fieldnames = base_fieldnames + dynamic_fieldnames
-            mode = "w" if existing_fieldnames != fieldnames else "a"
-            with path.open(mode, encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                if mode == "w":
+            write_header = (not path.exists()) or path.stat().st_size == 0
+            with path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=compact_fieldnames, extrasaction="ignore")
+                if write_header:
                     writer.writeheader()
-                    writer.writerows(existing_rows)
                 writer.writerows(rows)
 
         self.logger.info("Flushed %d events of type csv", len(events))
@@ -542,7 +571,12 @@ class LocalDAQ:
                     event_group.attrs["source"] = str(event.source)
                     event_group.attrs["method"] = str(event.method)
                     event_group.attrs["direction"] = str(event.direction)
-                    _write_hdf5_value(event_group, "data", event.data)
+                    if self.config.verbose_save:
+                        _write_hdf5_value(event_group, "tags", event.tags)
+                        _write_hdf5_value(event_group, "data", event.data)
+                    else:
+                        for key, value in _compact_event_data(event).items():
+                            _write_compact_hdf5_value(event_group, key, value)
 
         self.logger.info("Flushed %d events of type hdf5", len(events))
 
@@ -553,10 +587,11 @@ class LocalDAQ:
 
     def commit(self, *, source: str, method: str, data: dict, direction: str = "out", run_id: str | None = None, producer_id: str | None = None, metadata: dict | None = None, tags: dict | None = None,) -> int:
         event_data = dict(data)
+        normalized_tags = _normalize_tags(tags)
         if metadata:
             event_data["metadata"] = metadata
-        if tags:
-            event_data["tags"] = tags
+        if normalized_tags:
+            event_data["tags"] = normalized_tags
 
         pending_event = PendingEvent(
             event_id=0,  # will be set in publish_pending_event
@@ -567,6 +602,7 @@ class LocalDAQ:
             method=method,
             direction=cast(Literal["in", "out", "error"], direction),
             data=event_data,
+            tags=normalized_tags,
         )
 
         self.publish_pending_event(pending_event)
@@ -594,6 +630,147 @@ class LocalDAQ:
         )
 
 
+def _extract_tags_from_data(data: Any) -> dict[str, Any]:
+    if not isinstance(data, Mapping):
+        return {}
+    tags = data.get("tags")
+    if not isinstance(tags, Mapping):
+        return {}
+    return dict(tags)
+
+
+def _compact_event_data(event: DAQEvent) -> dict[str, Any]:
+    value, unit = _extract_value_and_unit(event)
+    compact: dict[str, Any] = {}
+    if value is not None:
+        compact["value"] = value
+    if unit:
+        compact["unit"] = unit
+
+    integral, integral_unit = _extract_integral(event.data)
+    if integral is not None:
+        compact["integral"] = integral
+    if integral_unit:
+        compact["integral_unit"] = integral_unit
+
+    if compact:
+        return compact
+    return {"value": _compact_fallback_value(event.data)}
+
+
+def _compact_csv_row(event: DAQEvent) -> dict[str, Any]:
+    compact = _compact_event_data(event)
+    return {
+        "event_id": event.event_id,
+        "timestamp": event.timestamp,
+        "run_id": event.run_id,
+        "producer_id": event.producer_id,
+        "source": event.source,
+        "method": event.method,
+        "direction": event.direction,
+        "value": _compact_csv_scalar(compact.get("value")),
+        "unit": compact.get("unit", ""),
+        "integral": _compact_csv_scalar(compact.get("integral")),
+        "integral_unit": compact.get("integral_unit", ""),
+    }
+
+
+def _compact_csv_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return json.dumps(value, default=str)
+
+
+def _extract_value_and_unit(event: DAQEvent) -> tuple[Any | None, str]:
+    if not isinstance(event.data, Mapping):
+        return event.data, ""
+
+    preview = event.data.get("preview")
+    metadata = event.data.get("metadata")
+    unit = _extract_unit(metadata) or _extract_unit(preview) or _default_unit(event)
+
+    if isinstance(preview, Mapping):
+        state = preview.get("state")
+        if isinstance(state, Mapping):
+            if "value" in state:
+                return state.get("value"), unit
+            corrected = state.get("corrected_field")
+            if isinstance(corrected, Mapping):
+                return _compact_field_vector(corrected), unit or "G"
+
+        scalar = _first_numeric_scalar(preview)
+        if scalar is not None:
+            return scalar, unit
+
+    return None, unit
+
+
+def _extract_unit(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    unit = value.get("unit")
+    if isinstance(unit, str):
+        return unit
+    return ""
+
+
+def _default_unit(event: DAQEvent) -> str:
+    if event.source == "counter":
+        return "count"
+    if event.source == "magnetic_field":
+        return "G"
+    return ""
+
+
+def _compact_field_vector(value: Mapping[str, Any]) -> dict[str, Any]:
+    vector: dict[str, Any] = {}
+    for compact_key, source_key in (
+        ("x", "x_gauss"),
+        ("y", "y_gauss"),
+        ("z", "z_gauss"),
+    ):
+        if source_key in value:
+            vector[compact_key] = value[source_key]
+    return vector or dict(value)
+
+
+def _first_numeric_scalar(value: Mapping[str, Any]) -> int | float | bool | None:
+    for child in value.values():
+        if isinstance(child, bool | int | float):
+            return child
+    return None
+
+
+def _extract_integral(data: Any) -> tuple[Any | None, str]:
+    if not isinstance(data, Mapping):
+        return None, ""
+    analysis = data.get("analysis")
+    if not isinstance(analysis, Mapping):
+        return None, ""
+    integration = analysis.get("integration")
+    if not isinstance(integration, Mapping):
+        return None, ""
+    series = integration.get("series")
+    if isinstance(series, Sequence) and not isinstance(series, str | bytes | bytearray):
+        for item in series:
+            if isinstance(item, Mapping) and "integral" in item:
+                unit = item.get("integral_unit")
+                return item.get("integral"), unit if isinstance(unit, str) else ""
+    unit = integration.get("integral_unit")
+    return integration.get("integral"), unit if isinstance(unit, str) else ""
+
+
+def _compact_fallback_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        for key in ("value", "state", "preview"):
+            if key in value:
+                return _compact_fallback_value(value[key])
+        return json.dumps(value, default=str)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return json.dumps(list(value), default=str)
+    return value
+
+
 def _flatten_for_csv(value: Any, *, prefix: str) -> dict[str, Any]:
     if isinstance(value, Mapping):
         flattened: dict[str, Any] = {}
@@ -612,6 +789,32 @@ def _flatten_for_csv(value: Any, *, prefix: str) -> dict[str, Any]:
         return flattened
 
     return {prefix: _csv_scalar(value)}
+
+
+def _normalize_tags(tags: Mapping[str, Any] | None, *, prefix: str = "") -> dict[str, Any]:
+    if not tags:
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for key, value in tags.items():
+        tag_key = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            normalized.update(_normalize_tags(value, prefix=tag_key))
+            continue
+
+        scalar = _tag_scalar(value)
+        if scalar is not None:
+            normalized[tag_key] = scalar
+
+    return normalized
+
+
+def _tag_scalar(value: Any) -> str | bool | int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool | int | float | str):
+        return value
+    return str(value)
 
 
 def _csv_scalar(value: Any) -> Any:
@@ -681,6 +884,28 @@ def _write_hdf5_value(group, name: str, value: Any) -> None:
         group.create_dataset(safe_name, data=bytes(value))
         return
 
+    group.create_dataset(safe_name, data=value)
+
+
+def _write_compact_hdf5_value(group, name: str, value: Any) -> None:
+    if value is None:
+        return
+    safe_name = _safe_hdf5_name(name)
+    if isinstance(value, str):
+        group.create_dataset(safe_name, data=value, dtype=h5py.string_dtype("utf-8"))
+        return
+    if isinstance(value, Mapping) or (
+        isinstance(value, Sequence) and not isinstance(value, bytes | bytearray)
+    ):
+        group.create_dataset(
+            safe_name,
+            data=json.dumps(value, default=str),
+            dtype=h5py.string_dtype("utf-8"),
+        )
+        return
+    if isinstance(value, bytes | bytearray):
+        group.create_dataset(safe_name, data=bytes(value))
+        return
     group.create_dataset(safe_name, data=value)
 
 

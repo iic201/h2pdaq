@@ -21,6 +21,8 @@ _SKIPPED_FIELD_KEYS = {
     "zero_offset",
 }
 
+_BASE_TAG_KEYS = {"run_id", "producer_id", "source", "method", "direction"}
+
 
 @dataclass(frozen=True, slots=True)
 class LocalInfluxConfig:
@@ -100,6 +102,7 @@ def event_to_point(event: DAQEvent, measurement_prefix: str = "daq"):
     point.tag("source", str(event.source))
     point.tag("method", str(event.method))
     point.tag("direction", str(event.direction))
+    _add_event_tags(point, event.tags)
 
     timestamp = _parse_timestamp(event.timestamp)
     if timestamp is not None:
@@ -113,6 +116,38 @@ def event_to_point(event: DAQEvent, measurement_prefix: str = "daq"):
         point.field(key, value)
 
     return point
+
+
+def _add_event_tags(point: Any, tags: Mapping[str, Any]) -> None:
+    for key, value in _flatten_tags(tags).items():
+        tag_key = _safe_influx_key(key)
+        if tag_key in _BASE_TAG_KEYS:
+            tag_key = f"event_{tag_key}"
+        point.tag(tag_key, str(value))
+
+
+def _flatten_tags(value: Any, *, prefix: str = "") -> dict[str, str | bool | int | float]:
+    if isinstance(value, Mapping):
+        flattened: dict[str, str | bool | int | float] = {}
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_tags(child, prefix=child_prefix))
+        return flattened
+
+    scalar = _tag_scalar(value)
+    if scalar is None or not prefix:
+        return {}
+    return {prefix: scalar}
+
+
+def _tag_scalar(value: Any) -> str | bool | int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, bool | int | float | str):
+        return value
+    return str(value)
 
 
 def _measurement_name(prefix: str, source: str) -> str:

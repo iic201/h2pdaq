@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -13,6 +13,7 @@ class PendingEvent:
     method: str
     direction: Literal["in", "out", "error"]
     data: Any
+    tags: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True, slots=True)
 class DAQEvent:
@@ -24,6 +25,7 @@ class DAQEvent:
     method: str
     direction: Literal["in", "out", "error"]
     data: Any
+    tags: dict[str, Any] = field(default_factory=dict)
     
 @dataclass(slots=True)
 class LocalDAQStats:
@@ -50,6 +52,7 @@ class DAQConfig:
     central_flush_timeout_s: float = 2.0 # Maximum shutdown wait for best-effort central streaming.
     ingress_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     outbound_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
+    verbose_save: bool = False # Keep full expanded CSV/HDF5 payloads instead of compact event summaries.
     enable_central_stream: bool = False
     central_daq_address: str | None = None
     enable_local_influx: bool = False

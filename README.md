@@ -117,7 +117,7 @@ INFLUXDB_BUCKET
 INFLUXDB_MEASUREMENT_PREFIX
 ```
 
-Local Influx measurements are named `<measurement_prefix>_<source>`, for example `daq_counter`. Run/source/method metadata are written as tags. To keep the time-series schema compact, only finite numeric and boolean measurement values are written as fields; bulky descriptive subtrees such as `analysis`, `metadata`, `tags`, and board/static info stay in JSONL/CSV/HDF5.
+Local Influx measurements are named `<measurement_prefix>_<source>`, for example `daq_counter`. Run/source/method metadata and event-level `tags` are written as InfluxDB tags. To keep the time-series schema compact, only finite numeric and boolean measurement values are written as fields; bulky descriptive subtrees such as `analysis`, `metadata`, and board/static info stay in JSONL/CSV/HDF5.
 
 See [lib/readme-local-daq.md](lib/readme-local-daq.md) for the local DAQ flow in more detail.
 

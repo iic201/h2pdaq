@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import queue
 import sys
 import threading
@@ -22,7 +21,6 @@ from .grpc.gui_grpc import (
     GuiServiceClient,
     PreviewPoint,
     ServiceStatus,
-    frame_to_dict,
     frame_to_points,
     get_services,
 )
@@ -30,17 +28,21 @@ from .gui_ui import build_main_window_ui
 
 pg.setConfigOptions(antialias=True)
 
+STREAM_QUEUE_MAX_ITEMS = 500
+STREAM_DRAIN_MAX_ITEMS = 75
+STREAM_DRAIN_BUDGET_SECONDS = 0.015
+TICK_INTERVAL_MS = 100
+RENDER_INTERVAL_SECONDS = 0.25
+MAX_SERIES_SAMPLES = 1200
+MAX_FRAME_HISTORY = 1000
+MAX_PLOT_SAMPLES_PER_SERIES = 400
+MAX_TEXT_SERIES = 32
+
 
 @dataclass(slots=True)
 class Series:
     values: deque[tuple[float, float]]
     unit: str = ""
-
-def _compact_json(value: Any, limit: int = 1800) -> str:
-    text = json.dumps(value, indent=2, default=str)
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit].rstrip()}\n..."
 
 class InstrumentPreviewWindow(QtWidgets.QMainWindow):
     series_palette = ["#2563eb", "#dc2626", "#059669", "#7c3aed", "#ea580c", "#0891b2"]
@@ -61,19 +63,22 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self.target = initial_target
         self.source = initial_source
         self.manager_addr = manager_addr
-        self.points_q: queue.Queue[list[PreviewPoint]] = queue.Queue()
-        self.frames_q: queue.Queue[Any] = queue.Queue()
+        self.stream_q: queue.Queue[tuple[Any, list[PreviewPoint]]] = queue.Queue(
+            maxsize=STREAM_QUEUE_MAX_ITEMS
+        )
         self.services_q: queue.Queue[list[ServiceStatus]] = queue.Queue()
         self.errors_q: queue.Queue[str] = queue.Queue()
         self.stop_event = threading.Event()
         self.stream_paused_event = threading.Event()
         self._active_stream_call: Any | None = None
         self._stream_call_lock = threading.Lock()
-        self.series: dict[str, Series] = defaultdict(lambda: Series(deque()))
+        self.series: dict[str, Series] = defaultdict(
+            lambda: Series(deque(maxlen=MAX_SERIES_SAMPLES))
+        )
         self.curves: dict[str, pg.PlotDataItem] = {}
         self.series_colors: dict[str, str] = {}
         self._color_cycle = cycle(self.series_palette)
-        self.frame_history: deque[tuple[float, Any]] = deque()
+        self.frame_history: deque[tuple[float, Any]] = deque(maxlen=MAX_FRAME_HISTORY)
         self.latest_timestamp: float | None = None
         self.selection_region: pg.LinearRegionItem | None = None
         self.selection_label: pg.TextItem | None = None
@@ -81,6 +86,9 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self.services_by_address: dict[str, ServiceStatus] = {}
         self._last_error = ""
         self._discovery_error = ""
+        self._latest_status_point: PreviewPoint | None = None
+        self._dropped_stream_items = 0
+        self._last_render_monotonic = 0.0
 
         self.setWindowTitle("h2pgui")
         self.resize(1080, 640)
@@ -90,7 +98,7 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self._start_service_refresh()
 
         self._tick_timer = QtCore.QTimer(self)
-        self._tick_timer.setInterval(50)
+        self._tick_timer.setInterval(TICK_INTERVAL_MS)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start()
 
@@ -189,8 +197,7 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
 
     def _clear_display_data(self, checked: bool = False, *, announce: bool = True) -> None:
         _ = checked
-        self.points_q = queue.Queue()
-        self.frames_q = queue.Queue()
+        self.stream_q = queue.Queue(maxsize=STREAM_QUEUE_MAX_ITEMS)
         self.series.clear()
         self.curves.clear()
         self.series_colors.clear()
@@ -198,6 +205,9 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self.frame_history.clear()
         self.latest_timestamp = None
         self.latest_frame = None
+        self._latest_status_point = None
+        self._dropped_stream_items = 0
+        self._last_render_monotonic = 0.0
         self.latest_text.clear()
         self.plot_widget.clear()
         self.plot_widget.addLegend(offset=(12, 12))
@@ -217,7 +227,6 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self.latest_frame = frame
         self.latest_timestamp = timestamp
         self.frame_history.append((timestamp, frame))
-        self._trim_frame_history(timestamp)
         if self.selection_region is not None:
             current_bounds = self._selection_bounds()
             if current_bounds is None:
@@ -299,6 +308,19 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
                     return
                 time.sleep(0.1)
 
+    def _put_stream_item(self, frame: Any, points: list[PreviewPoint]) -> None:
+        item = (frame, points)
+        while not self.stop_event.is_set():
+            try:
+                self.stream_q.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self.stream_q.get_nowait()
+                    self._dropped_stream_items += 1
+                except queue.Empty:
+                    continue
+
     def _stream_worker(self) -> None:
         while not self.stop_event.is_set():
             if self.stream_paused_event.is_set():
@@ -323,12 +345,12 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
                     if self.stream_paused_event.is_set():
                         break
                     frame = response.frame
-                    self.frames_q.put(frame)
                     try:
-                        self.points_q.put(frame_to_points(frame))
+                        points = frame_to_points(frame)
                     except Exception as exc:
-                        self.points_q.put([])
+                        points = []
                         self.errors_q.put(f"Frame parse error: {exc}")
+                    self._put_stream_item(frame, points)
             except grpc.RpcError as exc:
                 if self.stop_event.is_set():
                     return
@@ -347,23 +369,25 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
 
     def _tick(self) -> None:
         changed = False
+        processed_stream_items = 0
+        stream_deadline = time.monotonic() + STREAM_DRAIN_BUDGET_SECONDS
 
-        while True:
+        while processed_stream_items < STREAM_DRAIN_MAX_ITEMS:
+            if processed_stream_items and time.monotonic() >= stream_deadline:
+                break
             try:
-                frame = self.frames_q.get_nowait()
+                frame, points = self.stream_q.get_nowait()
             except queue.Empty:
                 break
             self._record_frame(frame)
-            changed = True
-
-        while True:
-            try:
-                points = self.points_q.get_nowait()
-            except queue.Empty:
-                break
             for point in points:
                 self._record_point(point)
+            processed_stream_items += 1
             changed = True
+
+        if changed and self.latest_timestamp is not None:
+            self._trim_series_history(self.latest_timestamp)
+            self._trim_frame_history(self.latest_timestamp)
 
         while True:
             try:
@@ -385,8 +409,19 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             self._render_services(services)
 
         if changed:
-            self._update_latest_text()
-            self._refresh_plot()
+            if self._dropped_stream_items:
+                self._set_status(f"Preview skipped {self._dropped_stream_items} stale frames to keep up")
+                self._dropped_stream_items = 0
+            elif self._latest_status_point is not None:
+                point = self._latest_status_point
+                self._set_status(
+                    f"seq={point.sequence_id} {point.name}={point.value:g}{(' ' + point.unit) if point.unit else ''}"
+                )
+            now = time.monotonic()
+            if now - self._last_render_monotonic >= RENDER_INTERVAL_SECONDS:
+                self._last_render_monotonic = now
+                self._update_latest_text()
+                self._refresh_plot()
 
     def _render_services(self, services: list[ServiceStatus]) -> None:
         selected = self._selected_service_address()
@@ -471,10 +506,7 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         series.values.append((timestamp, point.value))
         series.unit = point.unit or series.unit
         self.latest_timestamp = timestamp
-        self._trim_series_history(timestamp)
-        self._set_status(
-            f"seq={point.sequence_id} {point.name}={point.value:g}{(' ' + point.unit) if point.unit else ''}"
-        )
+        self._latest_status_point = point
 
     def _save_history_interval(self) -> None:
         if self.client is None:
@@ -776,17 +808,47 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             self.series_colors[name] = color
         return color
 
+    def _plot_samples(
+        self,
+        values: list[tuple[float, float]],
+        latest_timestamp: float,
+    ) -> list[tuple[float, float]]:
+        visible_start = latest_timestamp - self.history_seconds
+        visible_values = [
+            (timestamp, value)
+            for timestamp, value in values
+            if timestamp >= visible_start
+        ]
+        if len(visible_values) <= MAX_PLOT_SAMPLES_PER_SERIES:
+            return visible_values
+
+        stride = max(
+            1,
+            (len(visible_values) + MAX_PLOT_SAMPLES_PER_SERIES - 1)
+            // MAX_PLOT_SAMPLES_PER_SERIES,
+        )
+        samples = visible_values[::stride]
+        if samples[-1] != visible_values[-1]:
+            samples.append(visible_values[-1])
+        return samples
+
     def _refresh_plot(self) -> None:
-        latest_timestamp = None
+        latest_timestamp = self.latest_timestamp
         min_t = None
         max_t = None
         min_v = None
         max_v = None
 
+        if latest_timestamp is None:
+            self.plot_widget.setTitle("Waiting for frames")
+            return
+
+        plotted_names: set[str] = set()
         for name, series in sorted(self.series.items()):
-            values = list(series.values)
+            values = self._plot_samples(list(series.values), latest_timestamp)
             if not values:
                 continue
+            plotted_names.add(name)
             timestamps = [timestamp for timestamp, _ in values]
             samples = [value for _, value in values]
             curve = self.curves.get(name)
@@ -809,13 +871,12 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             max_t = current_max_t if max_t is None else max(max_t, current_max_t)
             min_v = current_min_v if min_v is None else min(min_v, current_min_v)
             max_v = current_max_v if max_v is None else max(max_v, current_max_v)
-            latest_timestamp = current_max_t if latest_timestamp is None else max(latest_timestamp, current_max_t)
 
         for name in list(self.curves):
-            if name not in self.series:
+            if name not in plotted_names:
                 self.plot_widget.removeItem(self.curves.pop(name))
 
-        if latest_timestamp is None or min_t is None or max_t is None or min_v is None or max_v is None:
+        if min_t is None or max_t is None or min_v is None or max_v is None:
             self.plot_widget.setTitle("Waiting for frames")
             return
 
@@ -838,24 +899,23 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         if self.latest_frame is None:
             self.latest_text.clear()
             return
-        latest = frame_to_dict(self.latest_frame)
+        frame = self.latest_frame
+        payload_kind = frame.payload.WhichOneof("payload")
         lines = [
-            f"source: {latest.get('source', '')}",
-            f"producer: {latest.get('producer_id', '')}",
-            f"sequence: {latest.get('sequence_id', '')}",
-            f"kind: {latest.get('kind', '')}",
+            f"source: {frame.source}",
+            f"producer: {frame.producer_id}",
+            f"sequence: {frame.sequence_id}",
+            f"kind: {frame.kind}",
+            f"payload: {payload_kind or 'empty'}",
             "",
         ]
         has_values = False
-        for name, series in sorted(self.series.items()):
+        for name, series in sorted(self.series.items())[:MAX_TEXT_SERIES]:
             if series.values:
                 has_values = True
                 lines.append(f"{name}: {series.values[-1][1]:g} {series.unit}".rstrip())
         if not has_values:
             lines.append("No numeric values in this frame")
-        payload = latest.get("payload")
-        if payload:
-            lines.extend(["", "payload:", _compact_json(payload)])
         self.latest_text.setPlainText("\n".join(lines))
 
     def _start_local_stream(self) -> None:

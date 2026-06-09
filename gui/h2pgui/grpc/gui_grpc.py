@@ -34,6 +34,15 @@ class PreviewPoint:
     value: float
     unit: str = ""
 
+
+@dataclass(frozen=True, slots=True)
+class ArrayPreview:
+    values: list[float]
+    min_value: float | None
+    max_value: float | None
+    mean_value: float | None
+    count: int
+
 # PreviewInfo contains metadata 
 # about the instrument and available data sources.
 # Basically the GetInfoResponse turn into a class.
@@ -153,7 +162,9 @@ class GuiServiceClient:
         return response
 
 
-MAX_ARRAY_SERIES = 128
+MAX_VECTOR_SERIES = 32
+MAX_ARRAY_SERIES = 16
+MAX_STRUCT_SERIES = 32
 
 # Convert a gRPC frame to a list of PreviewPoints for plotting
 # Input - a frame with scalar, vector, array, or struct_value payload
@@ -187,7 +198,7 @@ def frame_to_points(frame) -> list[PreviewPoint]:
     if payload_kind == "vector":
         vector = frame.payload.vector
         points = []
-        for index, value in enumerate(vector.values):
+        for index, value in enumerate(vector.values[:MAX_VECTOR_SERIES]):
             numeric = _coerce_float(value)
             if numeric is None:
                 continue
@@ -207,32 +218,26 @@ def frame_to_points(frame) -> list[PreviewPoint]:
     # If payload is array, extract values up to MAX_ARRAY_SERIES with indexed names,
     # and if there are more values, also include min, max, and mean as additional points.
     if payload_kind == "array":
-        values = _array_values(frame.payload.array)
-        if not values:
+        preview = _array_preview(frame.payload.array, MAX_ARRAY_SERIES)
+        if preview.count <= 0:
             return []
         base_name = _value_name(frame, 0, frame.source or "array")
         unit = _value_unit(frame, 0)
         points = []
-        for index, value in enumerate(values[:MAX_ARRAY_SERIES]):
-            numeric = _coerce_float(value)
-            if numeric is None:
-                continue
-            name = base_name if len(values) == 1 else f"{base_name}[{index}]"
-            points.append(_point(frame, observed_at, name, numeric, unit=unit))
-        if len(values) > MAX_ARRAY_SERIES:
-            numeric_values = [v for v in (_coerce_float(v) for v in values) if v is not None]
-            if numeric_values:
+        for index, value in enumerate(preview.values):
+            name = base_name if preview.count == 1 else f"{base_name}[{index}]"
+            points.append(_point(frame, observed_at, name, value, unit=unit))
+        if preview.count > len(preview.values):
+            if (
+                preview.min_value is not None
+                and preview.max_value is not None
+                and preview.mean_value is not None
+            ):
                 points.extend(
                     [
-                        _point(frame, observed_at, f"{base_name}.min", min(numeric_values), unit=unit),
-                        _point(frame, observed_at, f"{base_name}.max", max(numeric_values), unit=unit),
-                        _point(
-                            frame,
-                            observed_at,
-                            f"{base_name}.mean",
-                            sum(numeric_values) / len(numeric_values),
-                            unit=unit,
-                        ),
+                        _point(frame, observed_at, f"{base_name}.min", preview.min_value, unit=unit),
+                        _point(frame, observed_at, f"{base_name}.max", preview.max_value, unit=unit),
+                        _point(frame, observed_at, f"{base_name}.mean", preview.mean_value, unit=unit),
                     ]
                 )
         return points
@@ -243,7 +248,7 @@ def frame_to_points(frame) -> list[PreviewPoint]:
         data = MessageToDict(frame.payload.struct_value, preserving_proto_field_name=True)
         return [
             _point(frame, observed_at, name, value)
-            for name, value in _walk_numeric_values(data)
+            for name, value in _walk_numeric_values(data, limit=MAX_STRUCT_SERIES)
         ]
 
     return []
@@ -326,54 +331,87 @@ def _coerce_float(value: Any) -> float | None:
 # Helper function to recursively walk a nested structure and yield all numeric values with their names
 # @param value: The value to walk, which can be a dict, list, or scalar
 # @param prefix: The prefix to use for naming the values, which accumulates the
-def _walk_numeric_values(value: Any, prefix: str = "") -> Iterable[tuple[str, float]]:
-    numeric = _coerce_float(value)
-    if numeric is not None:
-        yield prefix or "value", numeric
-        return
+def _walk_numeric_values(
+    value: Any,
+    prefix: str = "",
+    *,
+    limit: int | None = None,
+) -> Iterable[tuple[str, float]]:
+    yielded = 0
 
-    if isinstance(value, dict):
-        for key, child in value.items():
-            name = str(key)
-            child_prefix = f"{prefix}.{name}" if prefix else name
-            yield from _walk_numeric_values(child, child_prefix)
-        return
+    def walk(child_value: Any, child_prefix: str) -> Iterable[tuple[str, float]]:
+        nonlocal yielded
+        if limit is not None and yielded >= limit:
+            return
 
-    if isinstance(value, list | tuple):
-        for index, child in enumerate(value):
-            child_prefix = f"{prefix}[{index}]" if prefix else f"value[{index}]"
-            yield from _walk_numeric_values(child, child_prefix)
+        numeric = _coerce_float(child_value)
+        if numeric is not None:
+            yielded += 1
+            yield child_prefix or "value", numeric
+            return
 
-# Helper function to extract values from an array payload, handling different encodings and fallbacks
-# @param array_payload: The array payload from the gRPC frame to extract values from
-def _array_values(array_payload) -> list[Any]:
+        if isinstance(child_value, dict):
+            for key, grandchild in child_value.items():
+                if limit is not None and yielded >= limit:
+                    return
+                name = str(key)
+                grandchild_prefix = f"{child_prefix}.{name}" if child_prefix else name
+                yield from walk(grandchild, grandchild_prefix)
+            return
+
+        if isinstance(child_value, list | tuple):
+            for index, grandchild in enumerate(child_value):
+                if limit is not None and yielded >= limit:
+                    return
+                grandchild_prefix = (
+                    f"{child_prefix}[{index}]" if child_prefix else f"value[{index}]"
+                )
+                yield from walk(grandchild, grandchild_prefix)
+
+    yield from walk(value, prefix)
+
+def _array_preview(array_payload, limit: int) -> ArrayPreview:
     encoding = int(array_payload.encoding)
     data = bytes(array_payload.data)
 
     if encoding == pb2.ARRAY_ENCODING_RAW_F64_LE:
-        return _unpack_raw_values(data, "<d")
+        return _raw_array_preview(data, "<d", limit)
     if encoding == pb2.ARRAY_ENCODING_RAW_F32_LE:
-        return _unpack_raw_values(data, "<f")
+        return _raw_array_preview(data, "<f", limit)
 
-    values = _array_values_with_numpy(data, array_payload.dtype)
-    if values is not None:
-        return values
-    return []
+    preview = _array_preview_with_numpy(data, array_payload.dtype, limit)
+    if preview is not None:
+        return preview
+    return ArrayPreview([], None, None, None, 0)
 
-# Helper function to unpack raw binary data into a list of floats using struct
-# @param data: The raw binary data to unpack
-# @param fmt: The struct format string to use for unpacking (e.g. "<d" for little-endian float64)
-def _unpack_raw_values(data: bytes, fmt: str) -> list[float]:
+
+def _raw_array_preview(data: bytes, fmt: str, limit: int) -> ArrayPreview:
     size = struct.calcsize(fmt)
     usable = len(data) - (len(data) % size)
     if usable <= 0:
-        return []
-    return [item[0] for item in struct.iter_unpack(fmt, data[:usable])]
+        return ArrayPreview([], None, None, None, 0)
 
-# Helper function to extract array values using numpy if available, with a fallback to raw unpacking
-# @param data: The raw binary data to interpret as an array
-# @param dtype: The data type string to use for numpy interpretation (e.g. "float64")
-def _array_values_with_numpy(data: bytes, dtype: str) -> list[Any] | None:
+    values = []
+    min_value = None
+    max_value = None
+    total = 0.0
+    count = 0
+    for item in struct.iter_unpack(fmt, data[:usable]):
+        numeric = float(item[0])
+        if not math.isfinite(numeric):
+            continue
+        if len(values) < limit:
+            values.append(numeric)
+        min_value = numeric if min_value is None else min(min_value, numeric)
+        max_value = numeric if max_value is None else max(max_value, numeric)
+        total += numeric
+        count += 1
+
+    mean_value = total / count if count else None
+    return ArrayPreview(values, min_value, max_value, mean_value, count)
+
+
+def _array_preview_with_numpy(data: bytes, dtype: str, limit: int) -> ArrayPreview | None:
     try:
         import numpy as np
     except Exception:
@@ -392,10 +430,28 @@ def _array_values_with_numpy(data: bytes, dtype: str) -> list[Any] | None:
     if hasattr(loaded, "files"):
         files = list(loaded.files)
         if not files:
-            return []
+            return ArrayPreview([], None, None, None, 0)
         loaded = loaded[files[0]]
 
-    return loaded.reshape(-1).tolist()
+    try:
+        values = np.asarray(loaded).reshape(-1).astype(float, copy=False)
+    except Exception:
+        return ArrayPreview([], None, None, None, 0)
+    if values.size == 0:
+        return ArrayPreview([], None, None, None, 0)
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return ArrayPreview([], None, None, None, 0)
+
+    preview_values = [float(value) for value in finite[:limit]]
+    return ArrayPreview(
+        preview_values,
+        float(np.min(finite)),
+        float(np.max(finite)),
+        float(np.mean(finite)),
+        int(finite.size),
+    )
 
 # Helper function to format a protobuf Timestamp as an ISO 8601 string, handling None and timezone
 # @param value: The protobuf Timestamp to format

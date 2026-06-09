@@ -139,6 +139,7 @@ class CentralDAQService(CentralDAQServiceServicer):
         while True:
             event = await self._ingest_q.get()
             try:
+                data = _decode_event_data(event.data)
                 daq_event = DAQEvent(
                     event_id=event.event_id,
                     timestamp=event.timestamp,
@@ -147,7 +148,8 @@ class CentralDAQService(CentralDAQServiceServicer):
                     source=event.source,
                     method=event.method,
                     direction=cast(Literal["in", "out", "error"], event.direction),
-                    data=_decode_event_data(event.data),
+                    data=data,
+                    tags=_extract_tags(data),
                 )
                 await self._outbound_csv_q.put(daq_event)
                 # Uncomment if you want to output JSONL
@@ -205,6 +207,7 @@ class CentralDAQService(CentralDAQServiceServicer):
                 "source",
                 "method",
                 "direction",
+                "tags",
                 "data",
             ])
             if write_header:
@@ -217,6 +220,7 @@ class CentralDAQService(CentralDAQServiceServicer):
                 "source": event.source,
                 "method": event.method,
                 "direction": event.direction,
+                "tags": json.dumps(event.tags, default=str),
                 "data": json.dumps(event.data, default=str),
             })
 
@@ -260,6 +264,7 @@ class CentralDAQService(CentralDAQServiceServicer):
             "source": event.source,
             "method": event.method,
             "direction": event.direction,
+            "tags": event.tags,
             "data": event.data,
         }, default=str)
 
@@ -337,6 +342,7 @@ class CentralDAQService(CentralDAQServiceServicer):
             event_group.attrs["source"] = event.source
             event_group.attrs["method"] = event.method
             event_group.attrs["direction"] = event.direction
+            event_group.attrs["tags"] = json.dumps(event.tags, default=str)
             # Assuming data is JSON-serializable; if not, this will need to be adapted.
             event_group.create_dataset("data", data=json.dumps(event.data, default=str))
 
@@ -362,6 +368,15 @@ def _decode_event_data(value: str) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def _extract_tags(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    tags = data.get("tags")
+    if not isinstance(tags, dict):
+        return {}
+    return dict(tags)
 
 
 def _safe_path_part(value: Any) -> str:

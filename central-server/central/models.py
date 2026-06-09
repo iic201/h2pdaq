@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -13,6 +13,7 @@ class DAQEvent:
     method: str
     direction: Literal["in", "out", "error"]
     data: Any
+    tags: dict[str, Any] = field(default_factory=dict)
     
 @dataclass(slots=True)
 class CentralDAQStats:
@@ -39,4 +40,3 @@ class CentralDAQConfig:
     ingress_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     outbound_overflow: OverflowPolicy = OverflowPolicy.DROP_NEWEST
     address: str | None = None
-

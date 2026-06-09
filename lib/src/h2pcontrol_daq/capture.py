@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 import os
 import socket
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message
 from .pipeline import LocalDAQ, get_run_id
@@ -39,11 +39,13 @@ def capture(
         direction: str = "both",
         in_args: Sequence[int] | None = None,
         in_kwargs: Sequence[str] | None = None,
+        tags: Mapping[str, Any] | None = None,
     ):
 
     log_in = direction in ("in", "both")
     log_out = direction in ("out", "both")
     producer_id = f"{socket.gethostname()}_{os.getpid()}"
+    capture_tags = dict(tags or {})
 
     def decorator(func):
 
@@ -59,6 +61,8 @@ def capture(
                     "args": _normalize_for_json(picked_args),
                     "kwargs": _normalize_for_json(picked_kwargs),
                 }
+                if capture_tags:
+                    data["tags"] = capture_tags
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,
@@ -68,6 +72,7 @@ def capture(
                     method=func.__name__,
                     direction="in",
                     data=data,
+                    tags=capture_tags,
                 )
                 daq.publish_pending_event(pending_event)
 
@@ -76,6 +81,8 @@ def capture(
             if log_out:
                 timestamp = datetime.now().isoformat()
                 data = {"result": _normalize_for_json(result)}
+                if capture_tags:
+                    data["tags"] = capture_tags
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,
@@ -85,6 +92,7 @@ def capture(
                     method=func.__name__,
                     direction="out",
                     data=data,
+                    tags=capture_tags,
                 )
                 daq.publish_pending_event(pending_event)
             
