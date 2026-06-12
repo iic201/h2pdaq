@@ -9,7 +9,6 @@ import grpc
 
 from h2pcontrol.central_daq.v1.central_daq_pb2 import (
     StreamDAQEventsRequest,
-    StreamDAQEventsResponse,
 )
 from h2pcontrol.central_daq.v1.central_daq_pb2_grpc import (
     CentralDAQServiceStub,

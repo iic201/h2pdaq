@@ -15,11 +15,11 @@ with your hardware call and register your own instrument service next to `GuiSer
 ## Configure Local DAQ
 
 ```python
-from h2pcontrol_daq import DAQConfig, LocalDAQ
+from h2pcontrol_daq import DAQConfig, DAQSaveFormat, LocalDAQ
 
 daq = LocalDAQ(
     DAQConfig(
-        enable_local_influx=True,
+        save_formats=(DAQSaveFormat.CSV, DAQSaveFormat.HDF5, DAQSaveFormat.INFLUX),
         influxdb_url="http://localhost:8086",
         influxdb_token="YOUR_TOKEN",
         influxdb_org="beyerlab",
@@ -29,7 +29,7 @@ daq = LocalDAQ(
 )
 ```
 
-With `enable_local_influx=True`, each committed event is written to InfluxDB as:
+With `DAQSaveFormat.INFLUX`, each committed event is written to InfluxDB as:
 
 - measurement: `<measurement_prefix>_<source>`
 - tags: `run_id`, `producer_id`, `source`, `method`, `direction`, plus event-level `tags`
@@ -126,7 +126,7 @@ PREVIEW_SOURCE = "temperature"
 
 daq = LocalDAQ(
     DAQConfig(
-        enable_local_influx=True,
+        save_formats=("csv", "hdf5", "influx"),
         influxdb_url="http://localhost:8086",
         influxdb_token="YOUR_TOKEN",
         influxdb_org="beyerlab",
@@ -360,6 +360,7 @@ event_id = daq.commit(
         "device": "picoscope_5444d",
         "sweep_axis": "coil_current",
     },
+    save_formats=("hdf5",),
 )
 ```
 
@@ -400,6 +401,7 @@ class InstrumentService:
             "experiment": "checkout",
             "device": "temperature_sensor",
         },
+        save_formats=("csv", "influx"),
     )
     async def Read(self, request, context):
         value = read_sensor()
@@ -517,4 +519,3 @@ For a PicoScope, a good split is:
 - GUI preview: decimated waveform plus channel/time metadata
 - DAQ commit: full waveform, analysis scalars, metadata, and tags such as `rid`,
   `scan_id`, `sweep_axis`, and `device`
-

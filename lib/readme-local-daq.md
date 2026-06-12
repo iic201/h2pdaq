@@ -35,7 +35,7 @@ flowchart TB
 5. The decorator creates another `PendingEvent` after the method returns when `direction` includes `out`.
 6. `LocalDAQ.publish_pending_event(...)` assigns a monotonically increasing event id.
 7. The serializer task converts each `PendingEvent` into a `DAQEvent`.
-8. The event is fanned out to JSONL, CSV, HDF5, and optionally central gRPC and local InfluxDB writer queues.
+8. The event is fanned out to the configured CSV, HDF5, and/or local InfluxDB writer queues, and optionally to central gRPC.
 9. `await daq.stop()` flushes queues and cancels writer tasks during shutdown.
 
 Manual preview commits use the same pipeline through:
@@ -81,6 +81,42 @@ For preview commits, event data contains:
 - optional `metadata`
 
 Preview tags are also mirrored into the event-level `tags` map so file writers, central streaming, and InfluxDB can treat them as query labels.
+
+### Save Formats
+
+By default, `LocalDAQ` writes CSV and HDF5:
+
+```python
+from h2pcontrol_daq import DAQConfig, DAQSaveFormat, LocalDAQ
+
+daq = LocalDAQ(
+    DAQConfig(
+        save_formats=(DAQSaveFormat.CSV, DAQSaveFormat.HDF5),
+    )
+)
+```
+
+Supported values are `DAQSaveFormat.CSV`, `DAQSaveFormat.HDF5`, and
+`DAQSaveFormat.INFLUX`. String values such as `"csv"`, `"hdf5"`, and `"influx"` are
+also accepted.
+
+Manual commits and decorators can override the config for a specific event:
+
+```python
+daq.commit(
+    source="counter",
+    method="manual_capture",
+    data={"value": 42},
+    save_formats=("csv",),
+)
+
+@capture(daq, source="counter", save_formats=("hdf5", "influx"))
+async def Read(self, request, context):
+    ...
+```
+
+`None` means "use `DAQConfig.save_formats`"; an empty tuple means "do not write this
+event to any local save format."
 
 ### File Formats
 
@@ -138,14 +174,17 @@ Central streaming is controlled by `DAQConfig.enable_central_stream`.
 
 ### Local InfluxDB
 
-Local InfluxDB writes are controlled by `DAQConfig.enable_local_influx`. When enabled, every committed `DAQEvent` is written as an Influx point in addition to the local files.
+Local InfluxDB writes are controlled by `DAQConfig.save_formats` and the legacy
+`DAQConfig.enable_local_influx` flag. When `DAQSaveFormat.INFLUX` is selected, the
+event is written as an Influx point. When `enable_local_influx=True`, every committed
+event uses Influx unless a per-event `save_formats` override is provided.
 
 ```python
 from h2pcontrol_daq import DAQConfig, LocalDAQ
 
 daq = LocalDAQ(
     DAQConfig(
-        enable_local_influx=True,
+        save_formats=("csv", "hdf5", "influx"),
         influxdb_url="http://localhost:8086",
         influxdb_token="...",
         influxdb_org="beyer-labs",

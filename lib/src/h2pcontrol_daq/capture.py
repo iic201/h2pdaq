@@ -7,8 +7,14 @@ import socket
 from typing import Any, Mapping, Sequence
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message
-from .pipeline import LocalDAQ, get_run_id
-from .models import PendingEvent
+from .pipeline import (
+    LocalDAQ,
+    get_run_id,
+    _normalize_event_data,
+    _normalize_save_formats,
+    _validate_enabled_save_formats,
+)
+from .models import DAQSaveFormat, PendingEvent
 
 def _pick_args(args: Sequence[Any], indices: Sequence[int] | None):
     if indices is None:
@@ -40,12 +46,18 @@ def capture(
         in_args: Sequence[int] | None = None,
         in_kwargs: Sequence[str] | None = None,
         tags: Mapping[str, Any] | None = None,
+        unit: str = "",
+        metadata: Mapping[str, Any] | None = None,
+        save_formats: Sequence[DAQSaveFormat | str] | None = None,
     ):
 
     log_in = direction in ("in", "both")
     log_out = direction in ("out", "both")
     producer_id = f"{socket.gethostname()}_{os.getpid()}"
     capture_tags = dict(tags or {})
+    capture_save_formats = _normalize_save_formats(save_formats) if save_formats is not None else None
+    if capture_save_formats is not None:
+        _validate_enabled_save_formats(capture_save_formats, daq._enabled_save_formats)
 
     def decorator(func):
 
@@ -61,8 +73,7 @@ def capture(
                     "args": _normalize_for_json(picked_args),
                     "kwargs": _normalize_for_json(picked_kwargs),
                 }
-                if capture_tags:
-                    data["tags"] = capture_tags
+                data = _normalize_event_data(data, metadata=metadata, tags=capture_tags)
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,
@@ -73,6 +84,8 @@ def capture(
                     direction="in",
                     data=data,
                     tags=capture_tags,
+                    save_formats=capture_save_formats,
+                    normalized=True,
                 )
                 daq.publish_pending_event(pending_event)
 
@@ -80,9 +93,12 @@ def capture(
 
             if log_out:
                 timestamp = datetime.now().isoformat()
-                data = {"result": _normalize_for_json(result)}
-                if capture_tags:
-                    data["tags"] = capture_tags
+                data = _normalize_event_data(
+                    {"result": _normalize_for_json(result)},
+                    unit=unit,
+                    metadata=metadata,
+                    tags=capture_tags,
+                )
                 pending_event = PendingEvent(
                     event_id=0,
                     timestamp=timestamp,
@@ -93,10 +109,10 @@ def capture(
                     direction="out",
                     data=data,
                     tags=capture_tags,
+                    save_formats=capture_save_formats,
+                    normalized=True,
                 )
                 daq.publish_pending_event(pending_event)
-            
-            print(f"[DAQ]Captured event for method {func.__name__}")
 
             return result
 

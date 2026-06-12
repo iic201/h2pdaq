@@ -9,12 +9,12 @@ import csv
 import os
 import socket
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Literal, cast
-from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig, LocalDAQStats
+from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig, LocalDAQStats, DAQSaveFormat
 from .centralDAQ_connector.grpc_central_sink import GrpcDAQSink
 from .influx_sink import LocalInfluxSink
-from pathlib import Path
 from .buffer.preview import PreviewFrame
 
 _PROCESS_START_NS = time.time_ns()
@@ -28,16 +28,14 @@ def get_run_id() -> str:
 class LocalDAQ:
     def __init__(self, config: DAQConfig | None = None) -> None:
         self.config = config if config is not None else DAQConfig()
+        self.config.save_formats = _normalize_save_formats(self.config.save_formats)
+        self._enabled_save_formats = _event_save_formats(None, self.config)
         self.stats = LocalDAQStats()
         self.logger = self.setup_logger()
 
         self._ingress_q: asyncio.Queue[PendingEvent] = asyncio.Queue(
             maxsize=self.config.ingress_maxsize
         )
-        # Uncomment if you want to output JSONL
-        # self._outbound_jsonl_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
-        #     maxsize=self.config.outbound_maxsize
-        # )
         self._outbound_hdf5_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
@@ -64,22 +62,26 @@ class LocalDAQ:
 
     async def start(self) -> None:
         self.logger.info("Starting DAQ with config: %s", self.config)
-        if self.config.enable_local_influx:
+        if DAQSaveFormat.INFLUX in self._enabled_save_formats:
             self.local_influx_sink = LocalInfluxSink.from_daq_config(self.config)
             self.logger.info("[I] Local InfluxDB writes enabled.")
 
-        # Create one worker for the serializer and one each for the writers.
-        self._tasks = [
-            asyncio.create_task(self._serializer_loop(),
-                                name="daq-serializer"),
-            # Uncomment if you want to output JSONL
-            # asyncio.create_task(self._writer_jsonl_loop(),
-            #                     name="daq-writer-jsonl"),
-            asyncio.create_task(self._writer_hdf5_loop(),
-                                name="daq-writer-hdf5"),
-            asyncio.create_task(self._writer_csv_loop(),
-                                name="daq-writer-csv"),
-        ]
+        # Create the serializer and only the writers that can receive events.
+        self._tasks = [asyncio.create_task(self._serializer_loop(), name="daq-serializer")]
+        if DAQSaveFormat.HDF5 in self._enabled_save_formats:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._batch_writer_loop(self._outbound_hdf5_q, self._write_hdf5, "hdf5"),
+                    name="daq-writer-hdf5",
+                )
+            )
+        if DAQSaveFormat.CSV in self._enabled_save_formats:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._batch_writer_loop(self._outbound_csv_q, self._write_csv, "csv"),
+                    name="daq-writer-csv",
+                )
+            )
 
         if self.config.enable_central_stream:
             self.logger.info(
@@ -89,17 +91,9 @@ class LocalDAQ:
                                     name="daq-central-sink")
             )
 
-        if self.config.enable_local_influx:
-            self._tasks.append(
-                asyncio.create_task(self._writer_influx_loop(),
-                                    name="daq-writer-influx")
-            )
-
     async def stop(self) -> None:
         dropped_outbound = (
-            # Uncomment if you want to output JSONL
-            # self.stats.dropped_outbound_jsonl
-            + self.stats.dropped_outbound_hdf5
+            self.stats.dropped_outbound_hdf5
             + self.stats.dropped_outbound_csv
             + self.stats.dropped_outbound_central
             + self.stats.dropped_outbound_influx
@@ -109,8 +103,6 @@ class LocalDAQ:
         self._stopping = True
         # Wait for queues to be fully processed before cancelling tasks.
         await self._ingress_q.join()
-        # Uncomment if you want to output JSONL
-        # await self._outbound_jsonl_q.join()
         await self._outbound_hdf5_q.join()
         await self._outbound_csv_q.join()
         if self.config.enable_central_stream:
@@ -130,13 +122,13 @@ class LocalDAQ:
             self.local_influx_sink.close()
 
     def _create_data_path(self) -> bool:
-        Path("data").mkdir(parents=True, exist_ok=True)
-        if Path("data").exists():
+        data_path = Path("data")
+        data_path.mkdir(parents=True, exist_ok=True)
+        if data_path.is_dir():
             return True
-        else:
-            self.logger.error(
-                "Failed to create data directory at path: %s", Path("data"))
-            return False
+
+        self.logger.error("Failed to create data directory at path: %s", data_path)
+        return False
 
     def publish_pending_event(self, event: PendingEvent) -> None:
         event.event_id = self._event_id_counter
@@ -150,19 +142,15 @@ class LocalDAQ:
             q.put_nowait(item)
             return
 
-        if queue_name == "ingress":
-            counter_name = "dropped_ingress"
-        elif queue_name == "outbound_jsonl":
-            counter_name = "dropped_outbound_jsonl"
-        elif queue_name == "outbound_hdf5":
-            counter_name = "dropped_outbound_hdf5"
-        elif queue_name == "outbound_csv":
-            counter_name = "dropped_outbound_csv"
-        elif queue_name == "outbound_central":
-            counter_name = "dropped_outbound_central"
-        elif queue_name == "outbound_influx":
-            counter_name = "dropped_outbound_influx"
-        else:
+        counters = {
+            "ingress": "dropped_ingress",
+            "outbound_hdf5": "dropped_outbound_hdf5",
+            "outbound_csv": "dropped_outbound_csv",
+            "outbound_central": "dropped_outbound_central",
+            "outbound_influx": "dropped_outbound_influx",
+        }
+        counter_name = counters.get(queue_name)
+        if counter_name is None:
             raise ValueError(f"Unknown queue name: {queue_name}")
 
         if policy == OverflowPolicy.DROP_NEWEST:
@@ -226,17 +214,24 @@ class LocalDAQ:
 
     async def _serializer_loop(self) -> None:
         while True:
-            pending = await self._get_or_stop_pending(self._ingress_q, timeout=0.2)
+            pending = await self._get_or_stop(self._ingress_q, timeout=0.2)
             if pending is None:
                 if self._stopping:
                     break
                 continue
 
             try:
+                event_data = pending.data if pending.normalized else _normalize_event_data(pending.data)
+                unit_tags = {"unit": event_data.get("unit", "")} if event_data.get("unit") else {}
+                save_formats = _validate_enabled_save_formats(
+                    _event_save_formats(pending.save_formats, self.config),
+                    self._enabled_save_formats,
+                )
                 tags = _normalize_tags(
                     {
-                        **_normalize_tags(_extract_tags_from_data(pending.data)),
+                        **_normalize_tags(_extract_tags_from_data(event_data)),
                         **_normalize_tags(pending.tags if isinstance(pending.tags, Mapping) else {}),
+                        **unit_tags,
                     }
                 )
                 event = DAQEvent(
@@ -247,28 +242,25 @@ class LocalDAQ:
                     source=pending.source,
                     method=pending.method,
                     direction=pending.direction,
-                    data=pending.data,
+                    data=event_data,
                     tags=tags,
+                    save_formats=save_formats,
                 )
                 self.stats.serialized += 1
-                # self._queue_put_now(
-                #     self._outbound_jsonl_q,
-                #     event,
-                #     self.config.outbound_overflow,
-                #     "outbound_jsonl",
-                # )
-                self._queue_put_now(
-                    self._outbound_csv_q,
-                    event,
-                    self.config.outbound_overflow,
-                    "outbound_csv",
-                )
-                self._queue_put_now(
-                    self._outbound_hdf5_q,
-                    event,
-                    self.config.outbound_overflow,
-                    "outbound_hdf5",
-                )
+                if DAQSaveFormat.CSV in event.save_formats:
+                    self._queue_put_now(
+                        self._outbound_csv_q,
+                        event,
+                        self.config.outbound_overflow,
+                        "outbound_csv",
+                    )
+                if DAQSaveFormat.HDF5 in event.save_formats:
+                    self._queue_put_now(
+                        self._outbound_hdf5_q,
+                        event,
+                        self.config.outbound_overflow,
+                        "outbound_hdf5",
+                    )
 
                 if self.config.enable_central_stream:
                     self.logger.info(
@@ -280,7 +272,7 @@ class LocalDAQ:
                         "outbound_central",
                     )
 
-                if self.config.enable_local_influx:
+                if DAQSaveFormat.INFLUX in event.save_formats:
                     self._queue_put_now(
                         self._outbound_influx_q,
                         event,
@@ -292,97 +284,50 @@ class LocalDAQ:
             finally:
                 self._ingress_q.task_done()
 
-    async def _writer_jsonl_loop(self) -> None:
+    async def _batch_writer_loop(
+        self,
+        queue: asyncio.Queue[DAQEvent],
+        write_batch: Callable[[list[DAQEvent]], Awaitable[None]],
+        label: str,
+    ) -> None:
         batch: list[DAQEvent] = []
         last_flush = time.monotonic()
+        batch_size = max(1, self.config.writer_batch_size)
+        flush_interval = max(0.0, self.config.writer_flush_interval_s)
 
         while True:
-            event = await self._get_or_stop_daq_event(self._outbound_jsonl_q, timeout=0.5)
+            event = await self._get_or_stop(queue, timeout=0.5)
             if event is not None:
                 batch.append(event)
 
             now = time.monotonic()
-            flush_due = batch and (now - last_flush >= 1.0)
-            flush_on_stop = batch and self._stopping and self._outbound_jsonl_q.empty()
+            flush_due = batch and (
+                len(batch) >= batch_size or now - last_flush >= flush_interval
+            )
+            flush_on_stop = batch and self._stopping and queue.empty()
 
             if flush_due or flush_on_stop:
                 try:
-                    await self._write_jsonl(batch)
+                    await write_batch(batch)
                 except Exception:
                     self.logger.exception(
-                        "Failed to write batch of %d events", len(batch))
+                        "Failed to write %s batch of %d events", label, len(batch))
                 finally:
                     for _ in batch:
-                        self._outbound_jsonl_q.task_done()
+                        queue.task_done()
                     batch.clear()
                     last_flush = time.monotonic()
 
-            if self._stopping and self._outbound_jsonl_q.empty() and not batch:
-                break
-
-    async def _writer_csv_loop(self) -> None:
-        batch: list[DAQEvent] = []
-        last_flush = time.monotonic()
-
-        while True:
-            event = await self._get_or_stop_daq_event(self._outbound_csv_q, timeout=0.5)
-            if event is not None:
-                batch.append(event)
-
-            now = time.monotonic()
-            flush_due = batch and (now - last_flush >= 1.0)
-            flush_on_stop = batch and self._stopping and self._outbound_csv_q.empty()
-
-            if flush_due or flush_on_stop:
-                try:
-                    await self._write_csv(batch)
-                except Exception:
-                    self.logger.exception(
-                        "Failed to write batch of %d events", len(batch))
-                finally:
-                    for _ in batch:
-                        self._outbound_csv_q.task_done()
-                    batch.clear()
-                    last_flush = time.monotonic()
-
-            if self._stopping and self._outbound_csv_q.empty() and not batch:
-                break
-
-    async def _writer_hdf5_loop(self) -> None:
-        batch: list[DAQEvent] = []
-        last_flush = time.monotonic()
-
-        while True:
-            event = await self._get_or_stop_daq_event(self._outbound_hdf5_q, timeout=0.5)
-            if event is not None:
-                batch.append(event)
-
-            now = time.monotonic()
-            flush_due = batch and (now - last_flush >= 1.0)
-            flush_on_stop = batch and self._stopping and self._outbound_hdf5_q.empty()
-
-            if flush_due or flush_on_stop:
-                try:
-                    await self._write_hdf5(batch)
-                except Exception:
-                    self.logger.exception(
-                        "Failed to write batch of %d events", len(batch))
-                finally:
-                    for _ in batch:
-                        self._outbound_hdf5_q.task_done()
-                    batch.clear()
-                    last_flush = time.monotonic()
-
-            if self._stopping and self._outbound_hdf5_q.empty() and not batch:
+            if self._stopping and queue.empty() and not batch:
                 break
 
     async def _writer_influx_loop(self) -> None:
         while True:
-            event = await self._get_or_stop_daq_event(self._outbound_influx_q, timeout=0.5)
+            event = await self._get_or_stop(self._outbound_influx_q, timeout=0.5)
             if event is not None:
                 try:
                     if self.local_influx_sink is None:
-                        raise RuntimeError("Local InfluxDB sink was not initialized")
+                        self.local_influx_sink = LocalInfluxSink.from_daq_config(self.config)
                     await asyncio.to_thread(self.local_influx_sink.write_event, event)
                 except Exception:
                     self.stats.dropped_outbound_influx += 1
@@ -393,15 +338,7 @@ class LocalDAQ:
             if self._stopping and self._outbound_influx_q.empty():
                 break
 
-    async def _get_or_stop_pending(self, queue: asyncio.Queue, timeout: float) -> PendingEvent | None:
-        # self.logger.info("Attempting to get item from queue (%s) with timeout: %f", queue, timeout)
-        try:
-            return await asyncio.wait_for(queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
-
-    async def _get_or_stop_daq_event(self, queue: asyncio.Queue, timeout: float) -> DAQEvent | None:
-        # self.logger.info("Attempting to get item from queue (%s) with timeout: %f", queue, timeout)
+    async def _get_or_stop(self, queue: asyncio.Queue, timeout: float):
         try:
             return await asyncio.wait_for(queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -432,33 +369,6 @@ class LocalDAQ:
         logger.addHandler(error_file_handler)
 
         return logger
-
-    async def _write_jsonl(self, events: list[DAQEvent]) -> None:
-        if not self._data_path:
-            self.logger.error(
-                "[!] Data path not available. Cannot write JSONL.")
-            return
-
-        Path("data/jsonl").mkdir(parents=True, exist_ok=True)
-
-        for event in events:
-            path = Path("data/jsonl") / \
-                f"daq_capture_{_safe_filename_part(event.run_id)}.jsonl"
-            record = {
-                "event_id": event.event_id,
-                "timestamp": event.timestamp,
-                "run_id": event.run_id,
-                "producer_id": event.producer_id,
-                "source": event.source,
-                "method": event.method,
-                "direction": event.direction,
-                "tags": event.tags,
-                "message": event.data,
-            }
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record) + "\n")
-
-        self.logger.info("Flushed %d events of type jsonl", len(events))
 
     async def _write_csv(self, events: list[DAQEvent]) -> None:
         if not self._data_path:
@@ -560,10 +470,14 @@ class LocalDAQ:
             path = Path("data/hdf5") / f"daq_capture_{_safe_filename_part(run_id)}.hdf5"
             with h5py.File(path, "a") as f:
                 f.attrs["run_id"] = str(run_id)
+                run_group = f.require_group(str(run_id))
                 for event in run_events:
-                    run_group = f.require_group(str(event.run_id))
-                    event_key = _unique_hdf5_key(run_group, str(event.event_id))
-                    event_group = run_group.create_group(event_key)
+                    try:
+                        event_group = run_group.create_group(str(event.event_id))
+                    except ValueError:
+                        event_group = run_group.create_group(
+                            _unique_hdf5_key(run_group, str(event.event_id))
+                        )
                     event_group.attrs["event_id"] = int(event.event_id)
                     event_group.attrs["timestamp"] = str(event.timestamp)
                     event_group.attrs["run_id"] = str(event.run_id)
@@ -585,13 +499,13 @@ class LocalDAQ:
     ####################### They will not be executed when decorating a function #########################
     ######################################################################################################
 
-    def commit(self, *, source: str, method: str, data: dict, direction: str = "out", run_id: str | None = None, producer_id: str | None = None, metadata: dict | None = None, tags: dict | None = None,) -> int:
-        event_data = dict(data)
+    def commit(self, *, source: str, method: str, data: Any, direction: str = "out", run_id: str | None = None, producer_id: str | None = None, unit: str = "", metadata: dict | None = None, analysis: dict | None = None, tags: dict | None = None, save_formats: Sequence[DAQSaveFormat | str] | None = None,) -> int:
+        requested_formats = _normalize_save_formats(save_formats) if save_formats is not None else None
+        if requested_formats is not None:
+            _validate_enabled_save_formats(requested_formats, self._enabled_save_formats)
+
+        event_data = _normalize_event_data(data, unit=unit, metadata=metadata, analysis=analysis, tags=tags)
         normalized_tags = _normalize_tags(tags)
-        if metadata:
-            event_data["metadata"] = metadata
-        if normalized_tags:
-            event_data["tags"] = normalized_tags
 
         pending_event = PendingEvent(
             event_id=0,  # will be set in publish_pending_event
@@ -603,13 +517,15 @@ class LocalDAQ:
             direction=cast(Literal["in", "out", "error"], direction),
             data=event_data,
             tags=normalized_tags,
+            save_formats=requested_formats,
+            normalized=True,
         )
 
         self.publish_pending_event(pending_event)
 
         return pending_event.event_id
 
-    def commit_preview(self, preview: PreviewFrame, *, method: str = "manual_commit", analysis: dict | None = None, user_metadata: dict | None = None, tags: dict | None = None) -> int:
+    def commit_preview(self, preview: PreviewFrame, *, method: str = "manual_commit", analysis: dict | None = None, user_metadata: dict | None = None, tags: dict | None = None, unit: str = "", save_formats: Sequence[DAQSaveFormat | str] | None = None) -> int:
         metadata = {
             **preview.metadata,
             **(user_metadata or {}),
@@ -621,13 +537,152 @@ class LocalDAQ:
             source=preview.source,
             producer_id=preview.producer_id,
             method=method,
-            data={
-                "preview": preview.data,
-                "analysis": analysis or {},
-            },
+            data={"preview": preview.data},
+            unit=unit,
+            analysis=analysis,
             metadata=metadata,
             tags=tags,
+            save_formats=save_formats,
         )
+
+
+def _normalize_save_formats(
+    save_formats: Sequence[DAQSaveFormat | str],
+) -> tuple[DAQSaveFormat, ...]:
+    normalized: list[DAQSaveFormat] = []
+    for save_format in save_formats:
+        try:
+            format_value = (
+                save_format
+                if isinstance(save_format, DAQSaveFormat)
+                else DAQSaveFormat(str(save_format).lower())
+            )
+        except ValueError as exc:
+            valid = ", ".join(format.value for format in DAQSaveFormat)
+            raise ValueError(
+                f"Unknown DAQ save format {save_format!r}. Expected one of: {valid}"
+            ) from exc
+        if format_value not in normalized:
+            normalized.append(format_value)
+    return tuple(normalized)
+
+
+def _event_save_formats(
+    save_formats: Sequence[DAQSaveFormat | str] | None,
+    config: DAQConfig,
+) -> tuple[DAQSaveFormat, ...]:
+    if save_formats is not None:
+        return _normalize_save_formats(save_formats)
+
+    config_formats = list(_normalize_save_formats(config.save_formats))
+    if DAQSaveFormat.INFLUX not in config_formats:
+        config_formats.append(DAQSaveFormat.INFLUX)
+    return tuple(config_formats)
+
+
+def _validate_enabled_save_formats(
+    requested_formats: Sequence[DAQSaveFormat],
+    enabled_formats: Sequence[DAQSaveFormat],
+) -> tuple[DAQSaveFormat, ...]:
+    requested = tuple(requested_formats)
+    unsupported = [save_format for save_format in requested if save_format not in enabled_formats]
+    if unsupported:
+        enabled = ", ".join(save_format.value for save_format in enabled_formats) or "none"
+        invalid = ", ".join(save_format.value for save_format in unsupported)
+        raise ValueError(
+            f"Requested save format(s) {invalid} are not enabled for this DAQ instance. "
+            f"Enabled formats: {enabled}."
+        )
+    return requested
+
+
+def _normalize_event_data(
+    data: Any,
+    *,
+    unit: str = "",
+    metadata: Mapping[str, Any] | None = None,
+    analysis: Mapping[str, Any] | None = None,
+    tags: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    source = dict(data) if isinstance(data, Mapping) else {"value": data}
+    existing_metadata = source.get("metadata") if isinstance(source.get("metadata"), Mapping) else {}
+    existing_analysis = source.get("analysis") if isinstance(source.get("analysis"), Mapping) else {}
+    existing_tags = source.get("tags") if isinstance(source.get("tags"), Mapping) else {}
+
+    value, inferred_unit = _extract_value_unit_from_data(source)
+    normalized: dict[str, Any] = {
+        "value": value,
+        "unit": unit or inferred_unit,
+    }
+
+    merged_metadata = {**existing_metadata, **dict(metadata or {})}
+    if merged_metadata:
+        normalized["metadata"] = merged_metadata
+
+    merged_analysis = {**existing_analysis, **dict(analysis or {})}
+    if merged_analysis:
+        normalized["analysis"] = merged_analysis
+
+    merged_tags = _normalize_tags({**existing_tags, **dict(tags or {})})
+    if merged_tags:
+        normalized["tags"] = merged_tags
+
+    payload = _payload_without_standard_keys(source)
+    if payload:
+        normalized["payload"] = payload
+
+    return normalized
+
+
+def _extract_value_unit_from_data(data: Mapping[str, Any]) -> tuple[Any, str]:
+    unit = _extract_unit(data) or _extract_unit(data.get("metadata"))
+    if "value" in data:
+        return data.get("value"), unit
+
+    if "result" in data:
+        return data.get("result"), unit
+
+    preview = data.get("preview")
+    preview_value, preview_unit = _extract_value_unit_from_preview(preview)
+    if preview_value is not None:
+        return preview_value, unit or preview_unit
+
+    if "args" in data or "kwargs" in data:
+        return {
+            "args": data.get("args", []),
+            "kwargs": data.get("kwargs", {}),
+        }, unit
+
+    return dict(data), unit
+
+
+def _extract_value_unit_from_preview(preview: Any) -> tuple[Any | None, str]:
+    if not isinstance(preview, Mapping):
+        return None, ""
+
+    unit = _extract_unit(preview)
+    state = preview.get("state")
+    if isinstance(state, Mapping):
+        unit = unit or _extract_unit(state)
+        if "value" in state:
+            return state.get("value"), unit
+        corrected = state.get("corrected_field")
+        if isinstance(corrected, Mapping):
+            return _compact_field_vector(corrected), unit or "G"
+        reading = state.get("reading")
+        if isinstance(reading, Mapping):
+            return dict(reading), unit
+
+    scalar = _first_numeric_scalar(preview)
+    if scalar is not None:
+        return scalar, unit
+
+    return dict(preview), unit
+
+
+def _payload_without_standard_keys(data: Mapping[str, Any]) -> dict[str, Any]:
+    standard_keys = {"value", "unit", "result", "metadata", "analysis", "tags"}
+    return {key: value for key, value in data.items() if key not in standard_keys}
 
 
 def _extract_tags_from_data(data: Any) -> dict[str, Any]:
@@ -684,6 +739,9 @@ def _compact_csv_scalar(value: Any) -> Any:
 def _extract_value_and_unit(event: DAQEvent) -> tuple[Any | None, str]:
     if not isinstance(event.data, Mapping):
         return event.data, ""
+
+    if "value" in event.data:
+        return event.data.get("value"), _extract_unit(event.data) or _default_unit(event)
 
     preview = event.data.get("preview")
     metadata = event.data.get("metadata")

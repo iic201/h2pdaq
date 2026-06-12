@@ -84,14 +84,41 @@ data/hdf5/daq_capture_<run_id>.hdf5
 
 The `run_id` is generated once per Python process. Decorated captures and manual GUI/preview commits now use the same generated run id unless a caller explicitly passes one.
 
-Current format behavior:
+By default, `LocalDAQ` writes CSV and HDF5. Choose different formats globally with
+`DAQConfig.save_formats`:
+
+```python
+from h2pcontrol_daq import DAQConfig, DAQSaveFormat, LocalDAQ
+
+daq = LocalDAQ(
+    DAQConfig(
+        save_formats=(DAQSaveFormat.HDF5,),  # or ("hdf5",)
+    )
+)
+```
+
+You can also override formats for a single manual commit, preview commit, or capture
+decorator:
+
+```python
+daq.commit(
+    source="counter",
+    method="manual_capture",
+    data={"value": 42},
+    save_formats=("csv", "influx"),
+)
+```
+
+Supported save formats are `csv`, `hdf5`, and `influx`.
+
+Format behavior:
 
 - CSV flattens nested event data into columns such as `data.preview.state.value`.
 - HDF5 stores event metadata as attributes and nested event data as groups/datasets.
 
 ### Local InfluxDB Writes
 
-`LocalDAQ` can also write committed events directly to a local or reachable InfluxDB instance. It is disabled by default:
+`LocalDAQ` can also write committed events directly to a local or reachable InfluxDB instance. It is disabled by default. Enable it for every event with `enable_local_influx=True` or include `DAQSaveFormat.INFLUX` in `save_formats`:
 
 ```python
 from h2pcontrol_daq import DAQConfig, LocalDAQ
