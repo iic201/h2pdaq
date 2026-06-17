@@ -62,12 +62,17 @@ class LocalDAQ:
 
     async def start(self) -> None:
         self.logger.info("Starting DAQ with config: %s", self.config)
-        if DAQSaveFormat.INFLUX in self._enabled_save_formats:
+        influx_enabled = DAQSaveFormat.INFLUX in self._enabled_save_formats
+        if influx_enabled:
             self.local_influx_sink = LocalInfluxSink.from_daq_config(self.config)
             self.logger.info("[I] Local InfluxDB writes enabled.")
 
         # Create the serializer and only the writers that can receive events.
         self._tasks = [asyncio.create_task(self._serializer_loop(), name="daq-serializer")]
+        if influx_enabled:
+            self._tasks.append(
+                asyncio.create_task(self._writer_influx_loop(), name="daq-writer-influx")
+            )
         if DAQSaveFormat.HDF5 in self._enabled_save_formats:
             self._tasks.append(
                 asyncio.create_task(
@@ -575,8 +580,6 @@ def _event_save_formats(
         return _normalize_save_formats(save_formats)
 
     config_formats = list(_normalize_save_formats(config.save_formats))
-    if DAQSaveFormat.INFLUX not in config_formats:
-        config_formats.append(DAQSaveFormat.INFLUX)
     return tuple(config_formats)
 
 

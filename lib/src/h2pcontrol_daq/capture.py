@@ -1,5 +1,6 @@
 from __future__ import annotations
 import functools
+import inspect
 import json
 from datetime import datetime
 import os
@@ -61,10 +62,7 @@ def capture(
 
     def decorator(func):
 
-        @functools.wraps(func)
-        async def wrapper(self_svc, *args, **kwargs):
-            run_id = get_run_id()
-
+        def publish_input(args, kwargs, run_id: str) -> None:
             if log_in:
                 picked_args = _pick_args(args, in_args)
                 picked_kwargs = _pick_kwargs(kwargs, in_kwargs)
@@ -89,8 +87,7 @@ def capture(
                 )
                 daq.publish_pending_event(pending_event)
 
-            result = await func(self_svc, *args, **kwargs)
-
+        def publish_output(result, run_id: str) -> None:
             if log_out:
                 timestamp = datetime.now().isoformat()
                 data = _normalize_event_data(
@@ -114,8 +111,25 @@ def capture(
                 )
                 daq.publish_pending_event(pending_event)
 
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(self_svc, *args, **kwargs):
+                run_id = get_run_id()
+                publish_input(args, kwargs, run_id)
+                result = await func(self_svc, *args, **kwargs)
+                publish_output(result, run_id)
+                return result
+
+            return async_wrapper
+
+        @functools.wraps(func)
+        def sync_wrapper(self_svc, *args, **kwargs):
+            run_id = get_run_id()
+            publish_input(args, kwargs, run_id)
+            result = func(self_svc, *args, **kwargs)
+            publish_output(result, run_id)
             return result
 
-        return wrapper
+        return sync_wrapper
 
     return decorator

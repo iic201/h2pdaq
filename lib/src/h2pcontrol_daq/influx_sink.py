@@ -59,8 +59,8 @@ class LocalInfluxSink:
         except ImportError as exc:
             raise RuntimeError(
                 "Local InfluxDB writes require the 'influxdb-client' package. "
-                "Install h2pcontrol-daq with its current dependencies, then set "
-                "DAQConfig(enable_local_influx=True)."
+                "Install h2pcontrol-daq with its current dependencies, then include "
+                "'influx' in DAQConfig.save_formats."
             ) from exc
 
         if not config.token:
